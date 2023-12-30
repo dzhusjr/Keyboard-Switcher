@@ -68,5 +68,3 @@ def add_key(key):
 
 keyboard.on_release(callback=add_key)
 keyboard.wait()
-
-#either add multithread check for both dictionaries simultaneously or add exceptions
