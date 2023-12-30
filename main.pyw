@@ -1,6 +1,6 @@
 import keyboard,ctypes,requests
 from bs4 import BeautifulSoup as BS
-from plyer import notification, facades, wifi
+from plyer import notification
 
 user32 = ctypes.WinDLL('user32', use_last_error=True)
 
@@ -11,8 +11,12 @@ active = True
 ENG = 67699721
 UKR = -257424350
 
+with open("exceptions.txt", "r") as f:
+    exceptions = f.read().split("\n")
+
 def add_key(key):
-    global last_word, last_triggerd, active
+    global last_word, last_triggerd, active, exceptions
+
     key = key.name.lower()
     # if win32gui.GetCursorInfo()[1] != 65541:return #if cursor != I (to somehow detect that you are actually typing, not just gaming or sth) ❗❗❗❗
     current_layout = user32.GetKeyboardLayout(user32.GetWindowThreadProcessId(user32.GetForegroundWindow(), 0)) #autohotkey заважає
@@ -21,7 +25,7 @@ def add_key(key):
         except:pass
     if key == "space":
         print(last_word+ ": "+last_triggerd)
-        if len(last_word) < 3 or " " in last_word or last_word == last_triggerd or not active: last_word = ""; return
+        if len(last_word) < 3 or " " in last_word or last_word == last_triggerd or not active or last_word in exceptions: last_word = ""; return
         lang = 'ukr'
         try:
             try:transliterated = "".join([dictionary[i] for i in last_word]);lang = 'ukr'
@@ -64,3 +68,5 @@ def add_key(key):
 
 keyboard.on_release(callback=add_key)
 keyboard.wait()
+
+#either add multithread check for both dictionaries simultaneously or add exceptions
