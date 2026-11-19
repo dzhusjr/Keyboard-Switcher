@@ -411,6 +411,9 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // Typing state
     private var buffer: [Key] = []
     private var atWordStart = false     // a word boundary was seen right before `buffer`
+    /// Words (and empty gaps) before each Space typed since the last reset, so that backspacing
+    /// over a Space brings the previous word back and editing it still works.
+    private var history: [(keys: [Key], atStart: Bool)] = []
     private var last: Correction?
 
     private var active: Bool { settings.enabled }
@@ -482,9 +485,10 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let dnc = DistributedNotificationCenter.default()
         dnc.addObserver(forName: Notification.Name(kTISNotifySelectedKeyboardInputSourceChanged as String),
                         object: nil, queue: .main) { [weak self] _ in
-            // Layout changed mid-word: the tracked keys no longer describe the text. Keep `last` (undo).
-            guard let self = self, !self.buffer.isEmpty else { return }
-            self.buffer.removeAll(); self.atWordStart = false
+            // The user changed layout mid-word: the tracked keys no longer describe the text.
+            // Our own switch after a fix is ignored (keys typed since then are re-checked anyway).
+            guard let self = self, Date() > self.ownSwitchUntil, !self.buffer.isEmpty else { return }
+            self.buffer.removeAll(); self.atWordStart = false; self.history.removeAll()
         }
         dnc.addObserver(forName: Notification.Name(kTISNotifyEnabledKeyboardInputSourcesChanged as String),
                         object: nil, queue: .main) { [weak self] _ in
@@ -515,7 +519,19 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: Event handling
 
-    private func reset() { buffer.removeAll(); atWordStart = false; last = nil }
+    private func reset() { buffer.removeAll(); atWordStart = false; last = nil; history.removeAll() }
+
+    private var ownSwitchUntil = Date.distantPast
+
+    private func selectLayout(_ source: TISInputSource) {
+        ownSwitchUntil = Date().addingTimeInterval(1.5)
+        TISSelectInputSource(source)
+    }
+
+    private func pushWord(_ keys: [Key]) {
+        history.append((keys, atWordStart))
+        if history.count > 10 { history.removeFirst() }
+    }
 
     fileprivate func handle(_ proxy: CGEventTapProxy, _ type: CGEventType, _ event: CGEvent) -> Unmanaged<CGEvent>? {
         let pass = Unmanaged.passUnretained(event)
@@ -547,12 +563,17 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         switch code {
         case kVK_Space:
-            if !isRepeat, !buffer.isEmpty, correct(proxy) { return nil }
+            if isRepeat { reset(); atWordStart = true; return pass }
+            if !buffer.isEmpty, correct(proxy) { return nil }
+            pushWord(buffer)
             buffer.removeAll(); atWordStart = true
         case kVK_Delete:
             if isRepeat { reset() }
-            else if buffer.isEmpty { atWordStart = false }   // deleting into text we never saw
-            else { buffer.removeLast() }
+            else if !buffer.isEmpty { buffer.removeLast() }
+            else if let prev = history.popLast() {           // deleted a Space: back into the previous word
+                buffer = prev.keys; atWordStart = prev.atStart
+            }
+            else { atWordStart = false }                     // deleting into text we never saw
         case kVK_Return, kVK_ANSI_KeypadEnter:
             buffer.removeAll(); atWordStart = true
         default:
@@ -637,10 +658,12 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for _ in buffer { post(UInt16(kVK_Delete), nil, shift: false, proxy) }
         for (key, c) in zip(buffer, newChars) { post(key.code, c, shift: key.shift, proxy) }
         post(UInt16(kVK_Space), " ", shift: false, proxy)
-        TISSelectInputSource(pair.to.source)
+        selectLayout(pair.to.source)
 
         last = Correction(typed: buffer, inserted: converted, from: pair.from.source,
                           word: Decision.core(typed), time: Date())
+        // Remember the word as it now appears, so backspacing into it keeps working.
+        pushWord(zip(buffer, newChars).map { Key(code: $0.code, shift: $0.shift, caps: $0.caps, char: $1) })
         buffer.removeAll()
         atWordStart = true
         return true
@@ -655,8 +678,9 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for _ in 0 ..< c.inserted.count + 1 { post(UInt16(kVK_Delete), nil, shift: false, proxy) }
         for key in c.typed { post(key.code, key.char, shift: key.shift, proxy) }
         post(UInt16(kVK_Space), " ", shift: false, proxy)
-        TISSelectInputSource(c.from)
+        selectLayout(c.from)
 
+        if let top = history.popLast() { history.append((c.typed, top.atStart)) }   // the original is back
         sessionIgnore.insert(c.word.lowercased())
         if settings.learnOnUndo { addException(c.word) }
         buffer.removeAll()
@@ -722,7 +746,8 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let trusted = AXIsProcessTrusted()
         statusItem?.button?.appearsDisabled = !active || !trusted
         statusItem?.menu?.item(withTag: 3)?.isHidden = trusted
-        statusItem?.menu?.item(withTag: 4)?.isHidden = !IsSecureEventInputEnabled()
+        let secureInput: Bool = IsSecureEventInputEnabled() == true   // compiles whether Bool or DarwinBoolean
+        statusItem?.menu?.item(withTag: 4)?.isHidden = !secureInput
         statusItem?.menu?.item(withTag: 1)?.state = active ? .on : .off
     }
 
