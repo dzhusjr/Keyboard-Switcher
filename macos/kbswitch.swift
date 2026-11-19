@@ -858,6 +858,10 @@ let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
 let engine = Engine()
 app.delegate = engine
+if CommandLine.arguments.contains("--unregister") {   // used by uninstall.sh
+    try? SMAppService.mainApp.unregister()
+    exit(0)
+}
 if CommandLine.arguments.contains("--check") {
     engine.report()
     exit(0)

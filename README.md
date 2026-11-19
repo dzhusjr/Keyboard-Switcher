@@ -49,8 +49,12 @@ certificate, so macOS recognises it as the same app.
 
 ## Uninstall
 
-Quit it from the menu-bar icon, then delete `/Applications/KBSwitch.app`. Settings stay in
-`~/.config/kbswitch/` (delete that folder too if you want).
+```bash
+cd Keyboard-Switcher/macos && ./uninstall.sh
+```
+
+This removes the app, its login item, its Accessibility permission, its settings and its signing
+keychain. Add `--all` to also remove the Ukrainian spell-check dictionary.
 
 ---
 
