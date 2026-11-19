@@ -100,7 +100,7 @@ struct Config {
             case "enabled": s.enabled = flag
             case "min_length": s.minLength = max(1, Int(value) ?? s.minLength)
             case "max_length": s.maxLength = max(1, Int(value) ?? s.maxLength)
-            case "undo_key": s.undoKey = value.lowercased()
+            case "undo_key": s.undoKey = value.lowercased() == "none" ? "none" : "escape"
             case "learn_on_undo": s.learnOnUndo = flag
             case "require_text_field": s.requireTextField = flag
             case "electron_accessibility": s.electronAccessibility = flag
@@ -504,7 +504,7 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         tap = t
         CFRunLoopAddSource(CFRunLoopGetMain(), CFMachPortCreateRunLoopSource(kCFAllocatorDefault, t, 0), .commonModes)
         CGEvent.tapEnable(tap: t, enable: true)
-        DebugLog.write("event tap installed")
+        DebugLog.write("event tap installed (pid \(ProcessInfo.processInfo.processIdentifier), Accessibility \(AXIsProcessTrusted()))")
         return true
     }
 
@@ -559,7 +559,7 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let v = ProcessInfo.processInfo.operatingSystemVersionString
         let app = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
         return """
-        macOS \(v) · KBSwitch \(app)
+        macOS \(v) · KBSwitch \(app) · pid \(ProcessInfo.processInfo.processIdentifier)
         English layout: \(layouts.english?.id ?? "NOT FOUND") · Ukrainian layout: \(layouts.ukrainian?.id ?? "NOT FOUND") · current: \(Layouts.currentID())
         en: \(lexicon.describe("en")) · uk: \(lexicon.describe("uk"))
         Accessibility: \(AXIsProcessTrusted()) · event tap: \(tap != nil) · secure input: \(IsSecureEventInputEnabled() == true)
@@ -664,7 +664,6 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func isUndoKey(_ code: Int) -> Bool {
         switch settings.undoKey {
         case "escape": return code == kVK_Escape
-        case "backspace": return code == kVK_Delete
         default: return false
         }
     }
@@ -973,7 +972,6 @@ struct SettingsView: View {
                 Toggle("Only in text fields", isOn: $model.config.requireTextField)
                 Picker("Undo a fix with", selection: $model.config.undoKey) {
                     Text("Esc").tag("escape")
-                    Text("Backspace").tag("backspace")
                     Text("Off").tag("none")
                 }
                 Toggle("Never convert undone words again", isOn: $model.config.learnOnUndo)
@@ -1024,6 +1022,12 @@ if CommandLine.arguments.contains("--unregister") {   // used by uninstall.sh
 }
 if CommandLine.arguments.contains("--check") {
     engine.report()
+    exit(0)
+}
+let me = ProcessInfo.processInfo.processIdentifier
+if let other = NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "")
+    .first(where: { $0.processIdentifier != me }) {
+    other.activate(options: [])     // only one KBSwitch may watch the keyboard
     exit(0)
 }
 engine.start()
