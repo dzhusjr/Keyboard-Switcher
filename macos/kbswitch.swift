@@ -338,6 +338,18 @@ enum FocusedField {
             && settable.boolValue
         guard textRoles.contains(role) || editable else { return .notText }
 
+        // Apps draw keystrokes asynchronously: when typing fast the last letters may not be in the
+        // field yet. Re-read a few times before deciding the text doesn't match.
+        var result = FieldState.mismatch
+        for attempt in 0..<4 {
+            if attempt > 0 { usleep(15_000) }
+            result = compare(el, word)
+            if result != .mismatch { break }
+        }
+        return result
+    }
+
+    private static func compare(_ el: AXUIElement, _ word: String) -> FieldState {
         guard let rv = attr(el, kAXSelectedTextRangeAttribute),
               CFGetTypeID(rv) == AXValueGetTypeID() else { return .unverified }
         var sel = CFRange()
@@ -381,7 +393,7 @@ struct Correction {
     let time: Date
 }
 
-final class Engine: NSObject, NSApplicationDelegate {
+final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private static let marker: Int64 = 0x4B42_5357          // tags our own synthetic events
     private var settings = Config()
     private var stamps: [Date?] = [nil, nil]
@@ -391,7 +403,8 @@ final class Engine: NSObject, NSApplicationDelegate {
     private var tap: CFMachPort?
     private var statusItem: NSStatusItem?
     private var settingsWindow: NSWindow?
-    private var headless = false        // --check: no menu-bar icon
+    private var headless = false
+    private var activity: NSObjectProtocol?        // --check: no menu-bar icon
     private var sessionIgnore = Set<String>()
     private var electronDone = Set<pid_t>()
 
@@ -403,6 +416,9 @@ final class Engine: NSObject, NSApplicationDelegate {
     private var active: Bool { settings.enabled }
 
     func start() {
+        // App Nap would delay the event tap after a while in the background.
+        activity = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiatedAllowingIdleSystemSleep, .latencyCritical], reason: "Watching typing")
         reloadIfChanged(force: true)
         observeSystem()
         // First launch: start at login by default (toggle in the menu).
@@ -507,6 +523,7 @@ final class Engine: NSObject, NSApplicationDelegate {
         case .keyDown: break
         case .tapDisabledByTimeout, .tapDisabledByUserInput:
             if let t = tap { CGEvent.tapEnable(tap: t, enable: true) }
+            DebugLog.write("event tap was disabled by macOS (\(type.rawValue)); re-enabled")
             reset(); return pass
         default:                                   // mouse click: the caret may have moved
             reset(); return pass
@@ -685,12 +702,14 @@ final class Engine: NSObject, NSApplicationDelegate {
                 item.button?.title = "ЯR"
             }
             let menu = NSMenu()
+            menu.delegate = self
             func add(_ title: String, _ action: Selector, tag: Int = 0) {
                 let mi = NSMenuItem(title: title, action: action, keyEquivalent: "")
                 mi.target = self
                 mi.tag = tag
                 menu.addItem(mi)
             }
+            add("Paused: secure input is on", #selector(explainSecureInput), tag: 4)
             add("Allow Accessibility…", #selector(openAccessibility), tag: 3)
             add("Enabled", #selector(toggleEnabled), tag: 1)
             menu.addItem(NSMenuItem.separator())
@@ -703,6 +722,7 @@ final class Engine: NSObject, NSApplicationDelegate {
         let trusted = AXIsProcessTrusted()
         statusItem?.button?.appearsDisabled = !active || !trusted
         statusItem?.menu?.item(withTag: 3)?.isHidden = trusted
+        statusItem?.menu?.item(withTag: 4)?.isHidden = !IsSecureEventInputEnabled()
         statusItem?.menu?.item(withTag: 1)?.state = active ? .on : .off
     }
 
@@ -715,6 +735,16 @@ final class Engine: NSObject, NSApplicationDelegate {
     }
 
     @objc private func quit() { NSApp.terminate(nil) }
+
+    func menuWillOpen(_ menu: NSMenu) { updateMenu() }
+
+    @objc private func explainSecureInput() {
+        let alert = NSAlert()
+        alert.messageText = "Secure input is on"
+        alert.informativeText = "While a password field is focused, or an app such as Terminal (Secure Keyboard Entry) or a password manager enables secure input, macOS hides typing from all other apps. KBSwitch resumes automatically when it ends."
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
+    }
 
     @objc private func openAccessibility() {
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
