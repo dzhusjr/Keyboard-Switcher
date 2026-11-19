@@ -420,7 +420,7 @@ final class Engine: NSObject, NSApplicationDelegate {
         if !installTap() {
             logLine("waiting for Accessibility permission…")
             Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] t in
-                if self?.installTap() ?? true { t.invalidate(); logLine("running") }
+                if self?.installTap() ?? true { t.invalidate(); self?.updateMenu(); logLine("running") }
             }
         } else { logLine("running") }
     }
@@ -432,7 +432,6 @@ final class Engine: NSObject, NSApplicationDelegate {
         print("Ukrainian layout: \(layouts.ukrainian?.id ?? "NOT FOUND")")
         print("English words:    \(lexicon.describe("en"))")
         print("Ukrainian words:  \(lexicon.describe("uk"))")
-        print("Accessibility:    \(AXIsProcessTrusted() ? "granted" : "NOT granted")")
     }
 
     // MARK: Setup
@@ -692,6 +691,7 @@ final class Engine: NSObject, NSApplicationDelegate {
                 mi.tag = tag
                 menu.addItem(mi)
             }
+            add("Allow Accessibility…", #selector(openAccessibility), tag: 3)
             add("Enabled", #selector(toggleEnabled), tag: 1)
             menu.addItem(NSMenuItem.separator())
             add("Settings…", #selector(openSettings))
@@ -700,7 +700,9 @@ final class Engine: NSObject, NSApplicationDelegate {
             item.menu = menu
             statusItem = item
         }
-        statusItem?.button?.appearsDisabled = !active
+        let trusted = AXIsProcessTrusted()
+        statusItem?.button?.appearsDisabled = !active || !trusted
+        statusItem?.menu?.item(withTag: 3)?.isHidden = trusted
         statusItem?.menu?.item(withTag: 1)?.state = active ? .on : .off
     }
 
@@ -713,6 +715,12 @@ final class Engine: NSObject, NSApplicationDelegate {
     }
 
     @objc private func quit() { NSApp.terminate(nil) }
+
+    @objc private func openAccessibility() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+            NSWorkspace.shared.open(url)
+        }
+    }
 
     @objc func openSettings() {
         if let w = settingsWindow, w.isVisible {
