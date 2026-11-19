@@ -292,18 +292,30 @@ enum Translit {
 
 final class Lexicon {
     private let checker = NSSpellChecker.shared
-    private var spellCode: [String: String] = [:]     // "uk" -> code the spell checker understands
+    private var spellCode: [String: String] = [:]     // "en" -> code the macOS spell checker understands
     private var extra: [String: Set<String>] = [:]    // optional ~/.config/kbswitch/words_<lang>.txt
+    /// Ukrainian is checked with Hunspell and the LibreOffice uk_UA dictionary bundled in the app:
+    /// macOS only partly understands that dictionary and rejects many valid forms (заплітала).
+    private var hunspell: OpaquePointer?
+    private var hunspellSource = ""
 
     init() {
         let available = checker.availableLanguages
         for lang in ["en", "uk"] {
             let exact = available.first(where: { $0 == lang })
             spellCode[lang] = exact ?? available.first(where: { $0.hasPrefix(lang + "_") || $0.hasPrefix(lang + "-") })
-            if let code = spellCode[lang] {   // warm up so the first real check is fast
-                _ = checker.checkSpelling(of: "test", startingAt: 0, language: code, wrap: false,
-                                          inSpellDocumentWithTag: 0, wordCount: nil)
-            }
+        }
+        if let code = spellCode["en"] {      // warm up so the first real check is fast
+            _ = checker.checkSpelling(of: "test", startingAt: 0, language: code, wrap: false,
+                                      inSpellDocumentWithTag: 0, wordCount: nil)
+        }
+        let candidates = [Bundle.main.resourceURL, FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Spelling")].compactMap { $0 }
+        for dir in candidates {
+            let aff = dir.appendingPathComponent("uk_UA.aff"), dic = dir.appendingPathComponent("uk_UA.dic")
+            guard FileManager.default.fileExists(atPath: aff.path), FileManager.default.fileExists(atPath: dic.path)
+            else { continue }
+            if let h = Hunspell_create(aff.path, dic.path) { hunspell = h; hunspellSource = dic.path; break }
         }
         reloadWordLists()
     }
@@ -315,18 +327,34 @@ final class Lexicon {
     }
 
     func describe(_ lang: String) -> String {
-        "spell checker: \(spellCode[lang] ?? "MISSING"), extra words: \(extra[lang]?.count ?? 0)"
+        if lang == "uk", hunspell != nil { return "hunspell \(hunspellSource), extra words: \(extra[lang]?.count ?? 0)" }
+        return "spell checker: \(spellCode[lang] ?? "MISSING"), extra words: \(extra[lang]?.count ?? 0)"
     }
 
     /// Without a dictionary for a language, every word would look "misspelled": never act then.
     func supports(_ lang: String) -> Bool {
-        spellCode[lang] != nil || !(extra[lang]?.isEmpty ?? true)
+        (lang == "uk" && hunspell != nil) || spellCode[lang] != nil || !(extra[lang]?.isEmpty ?? true)
+    }
+
+    /// A checker only has an opinion about words in its own alphabet (the macOS English checker,
+    /// for one, accepts any Cyrillic word).
+    private func inScript(_ word: String, _ lang: String) -> Bool {
+        word.allSatisfy { c in
+            guard c.isLetter else { return "'’ʼ-`".contains(c) }
+            guard let v = c.unicodeScalars.first?.value, c.unicodeScalars.count == 1 else { return false }
+            return lang == "uk" ? (0x0400...0x04FF).contains(v) : (0x41...0x5A).contains(v) || (0x61...0x7A).contains(v)
+        }
     }
 
     func isWord(_ word: String, _ lang: String) -> Bool {
+        guard !word.isEmpty, inScript(word, lang) else { return false }
         let variants = word == word.lowercased() ? [word] : [word, word.lowercased()]
         for v in variants {
             if extra[lang]?.contains(v.lowercased()) == true { return true }
+            if lang == "uk", let h = hunspell {
+                if Hunspell_spell(h, v.replacingOccurrences(of: "’", with: "'")) != 0 { return true }
+                continue
+            }
             if let code = spellCode[lang] {
                 let miss = checker.checkSpelling(of: v, startingAt: 0, language: code, wrap: false,
                                                  inSpellDocumentWithTag: 0, wordCount: nil)

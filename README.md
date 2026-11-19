@@ -29,8 +29,9 @@ cd Keyboard-Switcher/macos
 ```
 
 `build.sh` compiles the app, installs it to **/Applications/KBSwitch.app** and opens it.
-macOS has no Ukrainian spell checker, so the first run also installs the LibreOffice Ukrainian
-dictionary into `~/Library/Spelling`. That also gives you Ukrainian spell-check in every app.
+The first build also downloads the LibreOffice Ukrainian dictionary and compiles Hunspell (bundled in
+`macos/hunspell`) to check Ukrainian words. macOS has no Ukrainian spell checker of its own. Both are
+cached, so later builds take a few seconds.
 
 **3. Allow Accessibility (one time only):** when macOS asks, open *System Settings → Privacy &
 Security → Accessibility* and switch **KBSwitch** on. It starts working within 2 seconds. No
@@ -54,7 +55,7 @@ cd Keyboard-Switcher/macos && ./uninstall.sh
 ```
 
 This removes the app, its login item, its Accessibility permission, its settings and its signing
-keychain. Add `--all` to also remove the Ukrainian spell-check dictionary.
+keychain. Add `--all` to also remove a `uk_UA` dictionary from `~/Library/Spelling` (left by early versions).
 
 ---
 
@@ -63,7 +64,8 @@ keychain. Add `--all` to also remove the Ukrainian spell-check dictionary.
 Just type. When a word was typed in the wrong layout, pressing **Space** replaces it and switches
 the layout.
 
-- **Esc** right after a correction undoes it, and the word is never converted again.
+- **Esc** right after a correction undoes it, and the word is never converted again. (You can pick
+  Backspace as the undo key instead; a Backspace undo is not remembered, since it's also plain editing.)
 - **Menu-bar icon (ЯR):** Enabled · Settings… · Diagnostic Log · Quit. If you hide the icon, open KBSwitch from
   Applications or Spotlight to get the settings back.
 
@@ -74,9 +76,10 @@ only-in-text-fields, undo key, a "Never convert" word list and a list of ignored
 by default). Changes apply instantly.
 
 **Optional: Ukrainian typed in Latin.** Turn on *Ukrainian typed in Latin → Cyrillic* and words like
-`privit`, `dyakuyu` or `dobryi` become **привіт**, **дякую**, **добрий** when you press Space. It only
-fires for words that aren't English and have a dictionary-valid Ukrainian reading, it keeps your layout,
-and **Esc** undoes it. Off by default.
+`privit`, `dyakuyu` or `dobryi` become **привіт**, **дякую**, **добрий** when you press Space. Words that
+are also English (`yak`, `tak`) are converted only in context: right after a converted word, or together
+with the next word once that one converts (`yak spravy` → **як справи**). It keeps your layout, and the
+undo key reverts it. Off by default.
 
 If a word isn't fixed and you don't know why, choose **Diagnostic Log** in the menu, reproduce it,
 then choose **Show Log**. Every key, every forgotten word and every skipped correction is logged
@@ -100,6 +103,8 @@ It then deletes exactly the characters you typed, types the converted word and s
 ## Build details
 
 - Source: `macos/kbswitch.swift`, a single file using AppKit, Carbon (layouts) and Accessibility
+- Ukrainian words: Hunspell 1.7.2 (`macos/hunspell`, MPL/GPL/LGPL) with the LibreOffice `uk_UA` dictionary;
+  English words: the macOS spell checker
 - Icons: `macos/Resources/`
 - `./build.sh --ci` builds `macos/build/KBSwitch.zip` without installing. GitHub Actions runs this
   on every push and attaches the zip to releases tagged `v*`.

@@ -17,9 +17,40 @@ OUT=build/KBSwitch.app
 
 command -v swiftc >/dev/null || { echo "✗ swiftc not found. Run:  xcode-select --install   then run ./build.sh again."; exit 1; }
 
+CACHE="$HOME/Library/Caches/KBSwitch"
+mkdir -p "$CACHE"
+
+# Hunspell (in ./hunspell) checks Ukrainian words; compiled once and cached.
+HSOBJ="$CACHE/hunspell-1.7.2-$(uname -m)"
+if [ ! -f "$HSOBJ/.done" ]; then
+  echo "→ Compiling Hunspell (one time)"
+  rm -rf "$HSOBJ" && mkdir -p "$HSOBJ"
+  for f in hunspell/*.cxx; do
+    clang++ -c -O2 -std=c++11 -DHUNSPELL_STATIC -w -Ihunspell "$f" -o "$HSOBJ/$(basename "$f" .cxx).o"
+  done
+  touch "$HSOBJ/.done"
+fi
+
+# Ukrainian dictionary (LibreOffice uk_UA), downloaded once and bundled inside the app.
+if [ ! -f "$CACHE/uk_UA.dic" ]; then
+  echo "→ Downloading the Ukrainian dictionary (one time)"
+  DICT=https://raw.githubusercontent.com/LibreOffice/dictionaries/master/uk_UA
+  curl -fsSL "$DICT/uk_UA.aff" -o "$CACHE/uk_UA.aff.part" && curl -fsSL "$DICT/uk_UA.dic" -o "$CACHE/uk_UA.dic.part" \
+    || { rm -f "$CACHE"/*.part; echo "✗ Download failed. Check your internet connection and run ./build.sh again."; exit 1; }
+  mv "$CACHE/uk_UA.aff.part" "$CACHE/uk_UA.aff" && mv "$CACHE/uk_UA.dic.part" "$CACHE/uk_UA.dic"
+fi
+# Earlier versions installed this dictionary into ~/Library/Spelling, but macOS only half understands
+# it (valid verbs get underlined as typos in every app). Remove that copy if it is ours.
+if cmp -s "$CACHE/uk_UA.dic" "$HOME/Library/Spelling/uk_UA.dic"; then
+  rm -f "$HOME/Library/Spelling/uk_UA.aff" "$HOME/Library/Spelling/uk_UA.dic"
+  killall AppleSpell 2>/dev/null || true
+fi
+
 echo "→ Compiling"
 rm -rf build && mkdir -p "$OUT/Contents/MacOS" "$OUT/Contents/Resources"
-swiftc -O -swift-version 5 kbswitch.swift -o "$OUT/Contents/MacOS/kbswitch"
+swiftc -O -swift-version 5 -import-objc-header hunspell/bridge.h -Xcc -DHUNSPELL_STATIC -Xcc -Ihunspell \
+  kbswitch.swift "$HSOBJ"/*.o -lc++ -o "$OUT/Contents/MacOS/kbswitch"
+cp "$CACHE/uk_UA.aff" "$CACHE/uk_UA.dic" "$OUT/Contents/Resources/"
 cp Resources/MenuBarIcon.png Resources/MenuBarIcon@2x.png "$OUT/Contents/Resources/"
 # App icon: built from AppIcon.png with Apple's own tools so Finder/Spotlight/Dock read it reliably.
 ICONSET=$(mktemp -d)/AppIcon.iconset
@@ -94,20 +125,6 @@ if ! codesign --force --keychain "$KC" --sign "$CERT" "$OUT" 2>/dev/null; then
   echo "  ! could not sign with '$CERT': falling back to ad-hoc signing."
   echo "    The app works, but macOS will ask for Accessibility again after each rebuild."
   codesign --force --sign - "$OUT"
-fi
-
-# macOS has no Ukrainian spell checker; KBSwitch needs one to know which words are real.
-SPELL="$HOME/Library/Spelling"
-if [ ! -f "$SPELL/uk_UA.dic" ]; then
-  echo "→ Installing Ukrainian spell-check dictionary (LibreOffice uk_UA) into ~/Library/Spelling"
-  mkdir -p "$SPELL"
-  DICT=https://raw.githubusercontent.com/LibreOffice/dictionaries/master/uk_UA
-  if curl -fsSL "$DICT/uk_UA.aff" -o "$SPELL/uk_UA.aff" && curl -fsSL "$DICT/uk_UA.dic" -o "$SPELL/uk_UA.dic"; then
-    killall AppleSpell 2>/dev/null || true      # reload the system spell server
-  else
-    rm -f "$SPELL/uk_UA.aff" "$SPELL/uk_UA.dic"
-    echo "  ! download failed: Ukrainian words won't be recognised until you run ./build.sh again"
-  fi
 fi
 
 echo "→ Installing to /Applications"

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Completely removes KBSwitch: app, login item, Accessibility permission, settings, signing
-# keychain and logs.   ./uninstall.sh --all   also removes the Ukrainian spell-check dictionary.
+# keychain, cache and logs.   ./uninstall.sh --all   also removes a uk_UA dictionary in ~/Library/Spelling.
 ID=com.roman.kbswitch
 APP=/Applications/KBSwitch.app
 
@@ -13,7 +13,7 @@ rm -rf "$APP"
 tccutil reset Accessibility "$ID" >/dev/null 2>&1
 tccutil reset ListenEvent "$ID" >/dev/null 2>&1
 defaults delete "$ID" >/dev/null 2>&1
-rm -rf "$HOME/.config/kbswitch" "$HOME/Library/Logs/KBSwitch.log"
+rm -rf "$HOME/.config/kbswitch" "$HOME/Library/Logs/KBSwitch.log" "$HOME/Library/Caches/KBSwitch"
 security delete-keychain "$HOME/Library/Keychains/kbswitch-signing.keychain-db" 2>/dev/null
 
 # Leftovers from early test versions
