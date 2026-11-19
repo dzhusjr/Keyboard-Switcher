@@ -337,12 +337,19 @@ enum FocusedField {
         return AXUIElementCopyAttributeValue(el, name as CFString, &value) == .success ? value : nil
     }
 
+    static var detail = ""         // what the last check saw (diagnostic log)
+    /// Index of the candidate found before the caret by the last `check` that returned `.verified`.
+    static var matched = -1
+
     /// Checks that the focused element is an editable text field and that the text right before
     /// the caret is exactly `word`, preceded by whitespace / an opening bracket / start of text.
-    static var detail = ""         // what the last check saw (diagnostic log)
+    static func check(expect word: String) -> FieldState { check(candidates: [word]) }
 
-    static func check(expect word: String) -> FieldState {
+    /// Same, for several possible spellings of the same keys (one per layout): `matched` tells
+    /// which one is really in the field. This is the ground truth for what was typed.
+    static func check(candidates: [String]) -> FieldState {
         detail = ""
+        matched = -1
         let system = AXUIElementCreateSystemWide()
         AXUIElementSetMessagingTimeout(system, 0.08)
         guard let f = attr(system, kAXFocusedUIElementAttribute),
@@ -363,31 +370,34 @@ enum FocusedField {
         var result = FieldState.mismatch
         for attempt in 0..<4 {
             if attempt > 0 { usleep(15_000) }
-            result = compare(el, word)
+            result = compare(el, candidates)
             if result != .mismatch { break }
         }
         return result
     }
 
-    private static func compare(_ el: AXUIElement, _ word: String) -> FieldState {
+    private static func compare(_ el: AXUIElement, _ candidates: [String]) -> FieldState {
         guard let rv = attr(el, kAXSelectedTextRangeAttribute),
               CFGetTypeID(rv) == AXValueGetTypeID() else { return .unverified }
         var sel = CFRange()
         guard AXValueGetValue(rv as! AXValue, .cfRange, &sel) else { return .unverified }
-        guard sel.length == 0 else { return .mismatch }                 // something is selected
-
-        let start = sel.location - word.utf16.count
-        guard start >= 0 else { return .mismatch }
-        let from = max(0, start - 1)
+        guard sel.length == 0 else { detail += " selection"; return .mismatch }
+        let longest = candidates.map { $0.utf16.count }.max() ?? 0
+        let from = max(0, sel.location - longest - 1)
         guard let text = string(el, CFRange(location: from, length: sel.location - from)) else {
             detail += " caret=\(sel.location) text=unreadable"; return .unverified
         }
         detail += " caret=\(sel.location) before-caret='\(text)'"
-        guard text.hasSuffix(word) else { return .mismatch }
-        let before = text.dropLast(word.count)
-        if before.isEmpty { return start == 0 ? .verified : .mismatch }
-        guard before.count == 1, let c = before.first, c.isWhitespace || openers.contains(c) else { return .mismatch }
-        return .verified
+        for (i, word) in candidates.enumerated() where !word.isEmpty && text.hasSuffix(word) {
+            let start = sel.location - word.utf16.count
+            let before = text.dropLast(word.count)
+            let boundary: Bool
+            if start == 0 { boundary = true }
+            else if let c = before.last { boundary = c.isWhitespace || openers.contains(c) }
+            else { boundary = false }
+            if boundary { matched = i; return .verified }
+        }
+        return .mismatch
     }
 
     private static func string(_ el: AXUIElement, _ range: CFRange) -> String? {
@@ -561,7 +571,7 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func reset(_ why: String) {
         if DebugLog.on, !buffer.isEmpty || !history.isEmpty || atWordStart {
-            DebugLog.write("forget word ('\(buffer.map(\.char).joined())'): \(why)")
+            DebugLog.write("forget word \(spell(buffer)): \(why)")
         }
         buffer.removeAll(); atWordStart = false; last = nil; history.removeAll()
     }
@@ -571,6 +581,13 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func selectLayout(_ source: TISInputSource) {
         ownSwitchUntil = Date().addingTimeInterval(1.5)
         TISSelectInputSource(source)
+    }
+
+    /// "en|uk" spelling of keys, for the log.
+    private func spell(_ keys: [Key]) -> String {
+        let e = keys.map { layouts.english?.char(for: $0) ?? "?" }.joined()
+        let u = keys.map { layouts.ukrainian?.char(for: $0) ?? "?" }.joined()
+        return "'\(e)|\(u)'"
     }
 
     private func pushWord(_ keys: [Key]) {
@@ -613,7 +630,7 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         defer {
             if DebugLog.on {
-                DebugLog.write("key \(code)\(isRepeat ? " (held)" : "") → word='\(buffer.map(\.char).joined())' wordStartSeen=\(atWordStart) history=\(history.count) layout=\(Layouts.currentID())")
+                DebugLog.write("key \(code)\(isRepeat ? " (held)" : "") → word \(spell(buffer)) wordStartSeen=\(atWordStart) history=\(history.count)")
             }
         }
         switch code {
@@ -627,7 +644,7 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
             else if !buffer.isEmpty { buffer.removeLast() }
             else if let prev = history.popLast() {           // deleted a Space: back into the previous word
                 buffer = prev.keys; atWordStart = prev.atStart
-                DebugLog.write("backspace over Space: back into '\(buffer.map(\.char).joined())'")
+                DebugLog.write("backspace over Space: back into \(spell(buffer))")
             }
             else { atWordStart = false }                     // deleting into text we never saw
         case kVK_Return, kVK_ANSI_KeypadEnter:
@@ -675,39 +692,59 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         let appID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "?"
         if settings.excludedApps.contains(appID) { return skip("excluded app \(appID)") }
-        guard let pair = layouts.pair(for: buffer) else {
-            return skip("keys don't match exactly one of \(layouts.english?.id ?? "no English layout") / \(layouts.ukrainian?.id ?? "no Ukrainian layout") (macOS says current = \(Layouts.currentID()))")
+        guard let en = layouts.english, let uk = layouts.ukrainian else {
+            return skip("need both an English and a Ukrainian layout enabled")
         }
-        guard lexicon.supports(pair.from.lang), lexicon.supports(pair.to.lang) else {
+        guard lexicon.supports("en"), lexicon.supports("uk") else {
             return skip("no dictionary — en: \(lexicon.describe("en")); uk: \(lexicon.describe("uk"))")
         }
-
-        var newChars: [String] = []
+        // The same keys spelled in each layout. Computed from key codes only: the characters macOS
+        // reports to a background app can lag one layout switch behind.
+        var enChars: [String] = [], ukChars: [String] = []
         for key in buffer {
-            guard let c = pair.to.char(for: key) else { return skip("key \(key.code) has no character in \(pair.to.id)") }
-            newChars.append(c)
+            guard let e = en.char(for: key), let u = uk.char(for: key) else {
+                return skip("key \(key.code) has no single character in \(en.id) / \(uk.id)")
+            }
+            enChars.append(e); ukChars.append(u)
         }
-        let typed = buffer.map(\.char).joined()
-        let converted = newChars.joined()
+        let enText = enChars.joined(), ukText = ukChars.joined()
 
-        if let why = Decision.rejection(typed: typed, converted: converted,
-                                        fromLang: pair.from.lang, toLang: pair.to.lang,
-                                        minLength: settings.minLength,
-                                        exceptions: settings.exceptions.union(sessionIgnore),
-                                        isWord: lexicon.isWord) {
-            return skip("'\(typed)' → '\(converted)': \(why)")
+        // Cheap first: does converting make sense in either direction?
+        let exceptions = settings.exceptions.union(sessionIgnore)
+        let enToUk = Decision.rejection(typed: enText, converted: ukText, fromLang: "en", toLang: "uk",
+                                        minLength: settings.minLength, exceptions: exceptions, isWord: lexicon.isWord)
+        let ukToEn = Decision.rejection(typed: ukText, converted: enText, fromLang: "uk", toLang: "en",
+                                        minLength: settings.minLength, exceptions: exceptions, isWord: lexicon.isWord)
+        if let a = enToUk, let b = ukToEn {
+            return skip("en '\(enText)' / uk '\(ukText)': nothing to fix (en→uk: \(a); uk→en: \(b))")
         }
 
-        // Only touch the text if we are sure it is exactly the word we tracked.
-        let field = FocusedField.check(expect: typed)
-        DebugLog.write("  field: \(field) \(FocusedField.detail) wordStartSeen=\(atWordStart)")
+        // What is actually on screen decides which layout was used.
+        let field = FocusedField.check(candidates: [enText, ukText])
+        DebugLog.write("  field: \(field) \(FocusedField.detail) · wordStartSeen=\(atWordStart)")
+        let typedInEnglish: Bool
         switch field {
-        case .verified: break
-        case .unverified: guard atWordStart else { return skip("text unreadable in \(appID) and word start not seen") }
-        case .unknown, .notText:
-            guard !settings.requireTextField, atWordStart else { return skip("not a text field (\(field)) in \(appID)") }
-        case .secure, .mismatch: return skip("field check: \(field) in \(appID)")
+        case .verified:
+            typedInEnglish = FocusedField.matched == 0
+            if let why = typedInEnglish ? enToUk : ukToEn {
+                return skip("'\(typedInEnglish ? enText : ukText)' is on screen and is fine: \(why)")
+            }
+        case .unverified, .unknown, .notText:
+            if field != .unverified && settings.requireTextField { return skip("not a text field (\(field)) in \(appID)") }
+            guard atWordStart else { return skip("text unreadable in \(appID) and word start not seen") }
+            // Can't read the text, and macOS's idea of the layout may be stale. Use the only direction
+            // that makes sense: if the screen already shows the result, it is retyped unchanged.
+            guard (enToUk == nil) != (ukToEn == nil) else { return skip("text unreadable and both directions possible") }
+            typedInEnglish = enToUk == nil
+        case .secure, .mismatch:
+            return skip("field check: \(field) in \(appID)")
         }
+        let pair = typedInEnglish ? (from: en, to: uk) : (from: uk, to: en)
+        let fromChars = typedInEnglish ? enChars : ukChars
+        let newChars = typedInEnglish ? ukChars : enChars
+        let typed = fromChars.joined(), converted = newChars.joined()
+        // From here on the keys carry the characters that are really on screen.
+        buffer = zip(buffer, fromChars).map { Key(code: $0.code, shift: $0.shift, caps: $0.caps, char: $1) }
         DebugLog.write("fix: '\(typed)' → '\(converted)' in \(appID)")
 
         for _ in buffer { post(UInt16(kVK_Delete), nil, shift: false, proxy) }
