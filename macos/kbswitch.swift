@@ -15,6 +15,8 @@
 import Cocoa
 import Carbon.HIToolbox
 import ServiceManagement
+import SwiftUI
+import UniformTypeIdentifiers
 
 // MARK: - Files
 
@@ -25,44 +27,8 @@ enum Files {
     static let exceptions = dir.appendingPathComponent("exceptions.txt")
     static func words(_ lang: String) -> URL { dir.appendingPathComponent("words_\(lang).txt") }
 
-    static let defaultSettings = """
-    # kbswitch settings: changes apply automatically, no restart needed.
-
-    # Master switch (clicking the menu-bar icon can also pause it).
-    enabled = true
-
-    # Only words whose length is within this range are ever converted.
-    min_length = 3
-    max_length = 30
-
-    # Key that reverts the last correction if it is the very next key you press:
-    # escape, backspace or none. A reverted word is added to exceptions.txt if learn_on_undo = true.
-    undo_key = escape
-    learn_on_undo = true
-
-    # Act only when the focused element is an editable text field (recommended).
-    require_text_field = true
-
-    # Ask Electron apps (Slack, VS Code, Discord, ...) to expose their text fields, so the
-    # text-field check and the text verification work there too.
-    electron_accessibility = true
-
-    # Apps where kbswitch never does anything (bundle ids, comma separated).
-    # Find an id with:  osascript -e 'id of app "Terminal"'
-    excluded_apps = com.apple.Terminal, com.googlecode.iterm2
-
-    # Layouts to switch between. "auto" = first enabled English / Ukrainian layout.
-    # e.g. com.apple.keylayout.ABC, com.apple.keylayout.US, com.apple.keylayout.Ukrainian-PC
-    english_layout = auto
-    ukrainian_layout = auto
-
-    menu_bar_icon = true
-
-    """
-
     static let defaultExceptions = """
-    # Words that are never converted: one per line, written in either layout, case-insensitive.
-    # Corrections you undo are appended here automatically.
+    # Words that are never converted: one per line, in either layout. Editable in Settings.
 
     """
 
@@ -80,13 +46,24 @@ enum Files {
     }
 }
 
+/// Diagnostic log (Settings → "Write diagnostic log"): ~/Library/Logs/KBSwitch.log
+enum DebugLog {
+    static let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/KBSwitch.log")
+    static var on = false
+    static func write(_ message: String) {
+        guard on, let data = "\(Date()) \(message)\n".data(using: .utf8) else { return }
+        if let h = try? FileHandle(forWritingTo: url) { h.seekToEndOfFile(); h.write(data); try? h.close() }
+        else { try? data.write(to: url) }
+    }
+}
+
 func logLine(_ message: String) {
     FileHandle.standardError.write(("kbswitch: " + message + "\n").data(using: .utf8)!)
 }
 
 // MARK: - Settings
 
-struct Settings {
+struct Config {
     var enabled = true
     var minLength = 3
     var maxLength = 30
@@ -95,24 +72,23 @@ struct Settings {
     var requireTextField = true
     var electronAccessibility = true
     var menuBarIcon = true
-    var excludedApps = Set<String>()
+    var excludedApps: Set<String> = ["com.apple.Terminal", "com.googlecode.iterm2"]
+    var debugLog = false
     var englishLayout = "auto"
     var ukrainianLayout = "auto"
     var exceptions = Set<String>()
 
-    static func load() -> Settings {
+    static func load() -> Config {
         let fm = FileManager.default
         try? fm.createDirectory(at: Files.dir, withIntermediateDirectories: true)
-        if !fm.fileExists(atPath: Files.settings.path) {
-            try? Files.defaultSettings.write(to: Files.settings, atomically: true, encoding: .utf8)
-        }
+        if !fm.fileExists(atPath: Files.settings.path) { Config().save() }
         if !fm.fileExists(atPath: Files.exceptions.path) {
             try? Files.defaultExceptions.write(to: Files.exceptions, atomically: true, encoding: .utf8)
         }
 
-        var s = Settings()
+        var s = Config()
         for line in Files.lines(Files.settings) {
-            let kv = line.split(separator: "=", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
+            let kv = line.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false).map { $0.trimmingCharacters(in: .whitespaces) }
             guard kv.count == 2 else { continue }
             let value = kv[1]
             let flag = ["true", "yes", "on", "1"].contains(value.lowercased())
@@ -125,6 +101,7 @@ struct Settings {
             case "require_text_field": s.requireTextField = flag
             case "electron_accessibility": s.electronAccessibility = flag
             case "menu_bar_icon": s.menuBarIcon = flag
+            case "debug_log": s.debugLog = flag
             case "english_layout": s.englishLayout = value
             case "ukrainian_layout": s.ukrainianLayout = value
             case "excluded_apps":
@@ -136,6 +113,28 @@ struct Settings {
         s.maxLength = max(s.maxLength, s.minLength)
         s.exceptions = Set(Files.lines(Files.exceptions).map { $0.lowercased() })
         return s
+    }
+
+    /// Settings are edited in the Settings window; the file stays human-readable.
+    func save() {
+        let text = """
+        # KBSwitch settings. Change them in the app: menu-bar icon → Settings…
+        enabled = \(enabled)
+        min_length = \(minLength)
+        max_length = \(max(maxLength, minLength))
+        undo_key = \(undoKey)
+        learn_on_undo = \(learnOnUndo)
+        require_text_field = \(requireTextField)
+        electron_accessibility = \(electronAccessibility)
+        menu_bar_icon = \(menuBarIcon)
+        excluded_apps = \(excludedApps.sorted().joined(separator: ", "))
+        english_layout = \(englishLayout)
+        ukrainian_layout = \(ukrainianLayout)
+        debug_log = \(debugLog)
+
+        """
+        try? FileManager.default.createDirectory(at: Files.dir, withIntermediateDirectories: true)
+        try? text.write(to: Files.settings, atomically: true, encoding: .utf8)
     }
 }
 
@@ -154,7 +153,7 @@ private func tisValue(_ src: TISInputSource, _ key: CFString) -> AnyObject? {
     return Unmanaged<AnyObject>.fromOpaque(p).takeUnretainedValue()
 }
 
-final class Layout {
+final class KeyLayout {
     let source: TISInputSource
     let id: String
     let lang: String          // "en", "uk", ...
@@ -189,14 +188,14 @@ final class Layout {
 }
 
 final class Layouts {
-    private(set) var english: Layout?
-    private(set) var ukrainian: Layout?
+    private(set) var english: KeyLayout?
+    private(set) var ukrainian: KeyLayout?
 
-    func reload(_ s: Settings) {
+    func reload(_ s: Config) {
         let filter = [kTISPropertyInputSourceCategory as String: kTISCategoryKeyboardInputSource as String] as CFDictionary
         let sources = (TISCreateInputSourceList(filter, false)?.takeRetainedValue() as? [TISInputSource]) ?? []
-        let all = sources.compactMap(Layout.init)
-        func pick(_ lang: String, _ wanted: String) -> Layout? {
+        let all = sources.compactMap(KeyLayout.init)
+        func pick(_ lang: String, _ wanted: String) -> KeyLayout? {
             if wanted.lowercased() == "auto" { return all.first(where: { $0.lang == lang }) }
             return all.first(where: { $0.id == wanted })
         }
@@ -207,9 +206,9 @@ final class Layouts {
     }
 
     /// (current layout, layout to convert into), or nil if the current layout is neither language.
-    func pair() -> (from: Layout, to: Layout)? {
+    func pair() -> (from: KeyLayout, to: KeyLayout)? {
         guard let cur = TISCopyCurrentKeyboardLayoutInputSource()?.takeRetainedValue(),
-              let from = Layout(cur) else { return nil }
+              let from = KeyLayout(cur) else { return nil }
         switch from.lang {
         case "en": if let to = ukrainian { return (from, to) }
         case "uk": if let to = english { return (from, to) }
@@ -382,16 +381,17 @@ struct Correction {
     let time: Date
 }
 
-final class Engine: NSObject {
+final class Engine: NSObject, NSApplicationDelegate {
     private static let marker: Int64 = 0x4B42_5357          // tags our own synthetic events
-    private var settings = Settings()
+    private var settings = Config()
     private var stamps: [Date?] = [nil, nil]
     private let layouts = Layouts()
     private let lexicon = Lexicon()
     private let eventSource = CGEventSource(stateID: .privateState)
     private var tap: CFMachPort?
     private var statusItem: NSStatusItem?
-    private var paused = false
+    private var settingsWindow: NSWindow?
+    private var headless = false        // --check: no menu-bar icon
     private var sessionIgnore = Set<String>()
     private var electronDone = Set<pid_t>()
 
@@ -400,7 +400,7 @@ final class Engine: NSObject {
     private var atWordStart = false     // a word boundary was seen right before `buffer`
     private var last: Correction?
 
-    private var active: Bool { settings.enabled && !paused }
+    private var active: Bool { settings.enabled }
 
     func start() {
         reloadIfChanged(force: true)
@@ -426,6 +426,7 @@ final class Engine: NSObject {
     }
 
     func report() {
+        headless = true
         reloadIfChanged(force: true)
         print("English layout:   \(layouts.english?.id ?? "NOT FOUND")")
         print("Ukrainian layout: \(layouts.ukrainian?.id ?? "NOT FOUND")")
@@ -489,7 +490,8 @@ final class Engine: NSObject {
     private func reloadIfChanged(force: Bool = false) {
         let now = [Files.modified(Files.settings), Files.modified(Files.exceptions)]
         guard force || now != stamps else { return }
-        settings = Settings.load()
+        settings = Config.load()
+        DebugLog.on = settings.debugLog
         stamps = [Files.modified(Files.settings), Files.modified(Files.exceptions)]
         layouts.reload(settings)
         lexicon.reloadWordLists()
@@ -572,18 +574,26 @@ final class Engine: NSObject {
 
     private func correct(_ proxy: CGEventTapProxy) -> Bool {
         reloadIfChanged()
-        guard active, buffer.count >= settings.minLength, buffer.count <= settings.maxLength else { return false }
-        if let id = NSWorkspace.shared.frontmostApplication?.bundleIdentifier,
-           settings.excludedApps.contains(id) { return false }
-        guard let pair = layouts.pair(),
-              lexicon.supports(pair.from.lang), lexicon.supports(pair.to.lang) else { return false }
+        func skip(_ why: String) -> Bool { DebugLog.write("skip: \(why)"); return false }
+        guard active else { return false }
+        guard buffer.count >= settings.minLength, buffer.count <= settings.maxLength else {
+            return skip("length \(buffer.count) outside \(settings.minLength)…\(settings.maxLength)")
+        }
+        let appID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "?"
+        if settings.excludedApps.contains(appID) { return skip("excluded app \(appID)") }
+        guard let pair = layouts.pair() else { return skip("current layout is not English/Ukrainian, or the other one is not enabled") }
+        guard lexicon.supports(pair.from.lang), lexicon.supports(pair.to.lang) else {
+            return skip("no dictionary — en: \(lexicon.describe("en")); uk: \(lexicon.describe("uk"))")
+        }
 
         var typed = "", converted = ""
         var newChars: [String] = []
         for key in buffer {
             // Re-deriving each char through the current layout must reproduce what was typed
             // (guards against dead keys, input methods, remapping tools); otherwise do nothing.
-            guard pair.from.char(for: key) == key.char, let c = pair.to.char(for: key) else { return false }
+            guard pair.from.char(for: key) == key.char, let c = pair.to.char(for: key) else {
+                return skip("key \(key.code) does not map cleanly in \(pair.from.id)/\(pair.to.id)")
+            }
             typed += key.char
             converted += c
             newChars.append(c)
@@ -593,15 +603,20 @@ final class Engine: NSObject {
                                      fromLang: pair.from.lang, toLang: pair.to.lang,
                                      minLength: settings.minLength,
                                      exceptions: settings.exceptions.union(sessionIgnore),
-                                     isWord: lexicon.isWord) else { return false }
+                                     isWord: lexicon.isWord) else {
+            return skip("'\(typed)' → '\(converted)': typed is a word, or result is not a word (\(pair.to.lang))")
+        }
 
         // Only touch the text if we are sure it is exactly the word we tracked.
-        switch FocusedField.check(expect: typed) {
+        let field = FocusedField.check(expect: typed)
+        switch field {
         case .verified: break
-        case .unverified: guard atWordStart else { return false }
-        case .unknown, .notText: guard !settings.requireTextField, atWordStart else { return false }
-        case .secure, .mismatch: return false
+        case .unverified: guard atWordStart else { return skip("text unreadable in \(appID) and word start not seen") }
+        case .unknown, .notText:
+            guard !settings.requireTextField, atWordStart else { return skip("not a text field (\(field)) in \(appID)") }
+        case .secure, .mismatch: return skip("field check: \(field) in \(appID)")
         }
+        DebugLog.write("fix: '\(typed)' → '\(converted)' in \(appID)")
 
         for _ in buffer { post(UInt16(kVK_Delete), nil, shift: false, proxy) }
         for (key, c) in zip(buffer, newChars) { post(key.code, c, shift: key.shift, proxy) }
@@ -657,6 +672,7 @@ final class Engine: NSObject {
     // MARK: Menu-bar icon
 
     private func updateMenu() {
+        if headless { return }
         guard settings.menuBarIcon else {
             if let item = statusItem { NSStatusBar.system.removeStatusItem(item); statusItem = nil }
             return
@@ -667,7 +683,7 @@ final class Engine: NSObject {
                 icon.isTemplate = true                     // adapts to light/dark menu bar
                 item.button?.image = icon
             } else {
-                item.button?.title = "AЯ"
+                item.button?.title = "A/Я"
             }
             let menu = NSMenu()
             func add(_ title: String, _ action: Selector, tag: Int = 0) {
@@ -676,38 +692,155 @@ final class Engine: NSObject {
                 mi.tag = tag
                 menu.addItem(mi)
             }
-            add("Enabled", #selector(togglePause), tag: 1)
-            add("Start at Login", #selector(toggleLogin), tag: 2)
+            add("Enabled", #selector(toggleEnabled), tag: 1)
             menu.addItem(NSMenuItem.separator())
             add("Settings…", #selector(openSettings))
-            add("Exceptions…", #selector(openExceptions))
             menu.addItem(NSMenuItem.separator())
-            add("Quit kbswitch", #selector(quit))
+            add("Quit KBSwitch", #selector(quit))
             item.menu = menu
             statusItem = item
         }
         statusItem?.button?.appearsDisabled = !active
         statusItem?.menu?.item(withTag: 1)?.state = active ? .on : .off
-        statusItem?.menu?.item(withTag: 2)?.state = SMAppService.mainApp.status == .enabled ? .on : .off
     }
 
-    @objc private func togglePause() { paused.toggle(); reset(); updateMenu() }
-    @objc private func toggleLogin() {
-        let service = SMAppService.mainApp
-        do {
-            if service.status == .enabled { try service.unregister() } else { try service.register() }
-        } catch { logLine("login item: \(error)") }
-        updateMenu()
+    @objc private func toggleEnabled() {
+        var c = Config.load()
+        c.enabled.toggle()
+        c.save()
+        reset()
+        reloadIfChanged(force: true)
     }
-    @objc private func openSettings() { openInEditor(Files.settings) }
-    @objc private func openExceptions() { openInEditor(Files.exceptions) }
+
     @objc private func quit() { NSApp.terminate(nil) }
 
-    private func openInEditor(_ url: URL) {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-        p.arguments = ["-t", url.path]
-        try? p.run()
+    @objc func openSettings() {
+        if let w = settingsWindow, w.isVisible {
+            NSApp.activate(ignoringOtherApps: true); w.makeKeyAndOrderFront(nil); return
+        }
+        let model = SettingsModel { [weak self] in self?.reloadIfChanged(force: true) }
+        let w = NSWindow(contentViewController: NSHostingController(rootView: SettingsView(model: model)))
+        w.title = "KBSwitch"
+        w.styleMask = [.titled, .closable]
+        w.isReleasedWhenClosed = false
+        w.center()
+        settingsWindow = w
+        NSApp.activate(ignoringOtherApps: true)
+        w.makeKeyAndOrderFront(nil)
+    }
+
+    // Opening the app again (Finder, Spotlight) shows Settings, even if the menu-bar icon is hidden.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        openSettings()
+        return true
+    }
+}
+
+// MARK: - Settings window
+
+final class SettingsModel: ObservableObject {
+    @Published var config: Config {
+        didSet {
+            config.save()
+            onChange()
+        }
+    }
+    @Published var exceptions: String {
+        didSet {
+            let words = exceptions.components(separatedBy: .newlines)
+                .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+            try? (words.joined(separator: "\n") + "\n").write(to: Files.exceptions, atomically: true, encoding: .utf8)
+            onChange()
+        }
+    }
+    @Published var startAtLogin: Bool
+    private let onChange: () -> Void
+
+    init(onChange: @escaping () -> Void) {
+        self.config = Config.load()
+        self.exceptions = Files.lines(Files.exceptions).joined(separator: "\n")
+        self.startAtLogin = SMAppService.mainApp.status == .enabled
+        self.onChange = onChange
+    }
+
+    func setStartAtLogin(_ on: Bool) {
+        do { if on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() } }
+        catch { logLine("login item: \(error)") }
+        startAtLogin = SMAppService.mainApp.status == .enabled
+    }
+
+    var apps: [String] { config.excludedApps.sorted { name($0).lowercased() < name($1).lowercased() } }
+
+    func name(_ id: String) -> String {
+        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id) else { return id }
+        return FileManager.default.displayName(atPath: url.path).replacingOccurrences(of: ".app", with: "")
+    }
+
+    func addApps() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.application]
+        panel.allowsMultipleSelection = true
+        panel.directoryURL = URL(fileURLWithPath: "/Applications")
+        guard panel.runModal() == .OK else { return }
+        for url in panel.urls {
+            if let id = Bundle(url: url)?.bundleIdentifier { config.excludedApps.insert(id) }
+        }
+    }
+}
+
+struct SettingsView: View {
+    @ObservedObject var model: SettingsModel
+
+    var body: some View {
+        Form {
+            Section {
+                Toggle("Enabled", isOn: $model.config.enabled)
+                Toggle("Start at login", isOn: Binding(get: { model.startAtLogin },
+                                                       set: { model.setStartAtLogin($0) }))
+                Toggle("Show in menu bar", isOn: $model.config.menuBarIcon)
+            }
+            Section {
+                Stepper("Minimum word length: \(model.config.minLength)", value: $model.config.minLength, in: 1...10)
+                Stepper("Maximum word length: \(model.config.maxLength)", value: $model.config.maxLength, in: 3...60)
+                Toggle("Only in text fields", isOn: $model.config.requireTextField)
+                Picker("Undo a fix with", selection: $model.config.undoKey) {
+                    Text("Esc").tag("escape")
+                    Text("Backspace").tag("backspace")
+                    Text("Off").tag("none")
+                }
+                Toggle("Never convert undone words again", isOn: $model.config.learnOnUndo)
+            }
+            Section {
+                TextEditor(text: $model.exceptions)
+                    .font(.body.monospaced())
+                    .frame(height: 80)
+            } header: {
+                Text("Never convert")
+            } footer: {
+                Text("One word per line, in either layout.").foregroundStyle(.secondary)
+            }
+            Section {
+                ForEach(model.apps, id: \.self) { id in
+                    HStack {
+                        Text(model.name(id))
+                        Spacer()
+                        Button { model.config.excludedApps.remove(id) } label: { Image(systemName: "minus.circle") }
+                            .buttonStyle(.borderless)
+                    }
+                }
+                Button("Add App…") { model.addApps() }
+            } header: {
+                Text("Ignored apps")
+            }
+            Section {
+                Toggle("Write diagnostic log", isOn: $model.config.debugLog)
+            } footer: {
+                Text("Logs why words were or weren't fixed to ~/Library/Logs/KBSwitch.log. Includes the words, so keep it off normally.")
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+        .frame(width: 400, height: 620)
     }
 }
 
@@ -716,6 +849,7 @@ final class Engine: NSObject {
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
 let engine = Engine()
+app.delegate = engine
 if CommandLine.arguments.contains("--check") {
     engine.report()
     exit(0)

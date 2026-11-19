@@ -29,12 +29,14 @@ cd Keyboard-Switcher/macos
 ```
 
 `build.sh` compiles the app, installs it to **/Applications/KBSwitch.app** and opens it.
+macOS has no Ukrainian spell checker, so the first run also installs the LibreOffice Ukrainian
+dictionary into `~/Library/Spelling`. That also gives you Ukrainian spell-check in every app.
 
 **3. Allow Accessibility (one time only):** when macOS asks, open *System Settings → Privacy &
 Security → Accessibility* and switch **KBSwitch** on. It starts working within 2 seconds. No
 restart is needed.
 
-That's it. The **AЯ** icon appears in the menu bar, and the app starts automatically at every login.
+That's it. The **A/Я** icon appears in the menu bar, and the app starts automatically at every login.
 
 > The very first build creates a local signing certificate in your keychain. macOS may ask once
 > to let `codesign` use it: click **Always Allow**.
@@ -60,21 +62,18 @@ Quit it from the menu-bar icon, then delete `/Applications/KBSwitch.app`. Settin
 Just type. When a word was typed in the wrong layout, pressing **Space** replaces it and switches
 the layout.
 
-- **Esc** right after a correction undoes it, and the word is added to your exceptions.
-- **Menu-bar icon:** Enabled · Start at Login · Settings… · Exceptions… · Quit
+- **Esc** right after a correction undoes it, and the word is never converted again.
+- **Menu-bar icon (A/Я):** Enabled · Settings… · Quit. If you hide the icon, open KBSwitch from
+  Applications or Spotlight to get the settings back.
 
 ### Settings
 
-`~/.config/kbswitch/settings.txt` (open it from the menu). Changes apply instantly.
+A small native window: enable/disable, start at login, show in menu bar, minimum/maximum word length,
+only-in-text-fields, undo key, a "Never convert" word list and a list of ignored apps (Terminal and iTerm
+by default). Changes apply instantly.
 
-- `min_length` / `max_length`: only words of this length are converted (default 3–30)
-- `undo_key`: `escape`, `backspace` or `none`
-- `learn_on_undo`: add undone words to exceptions
-- `excluded_apps`: bundle ids where it never acts (Terminal and iTerm are excluded by default)
-- `require_text_field`: act only inside editable text fields (default on)
-- `english_layout` / `ukrainian_layout`: `auto`, or a layout id such as `com.apple.keylayout.ABC`
-
-`~/.config/kbswitch/exceptions.txt` lists words that are never converted, one per line, in either layout.
+If a word isn't fixed and you don't know why, turn on **Write diagnostic log** and check
+`~/Library/Logs/KBSwitch.log`.
 
 ### When does it replace a word?
 

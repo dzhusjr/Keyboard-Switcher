@@ -77,12 +77,28 @@ if ! codesign --force --sign "$CERT" "$OUT" 2>/dev/null; then
   codesign --force --sign - "$OUT"
 fi
 
+# macOS has no Ukrainian spell checker; KBSwitch needs one to know which words are real.
+SPELL="$HOME/Library/Spelling"
+if [ ! -f "$SPELL/uk_UA.dic" ]; then
+  echo "→ Installing Ukrainian spell-check dictionary (LibreOffice uk_UA) into ~/Library/Spelling"
+  mkdir -p "$SPELL"
+  DICT=https://raw.githubusercontent.com/LibreOffice/dictionaries/master/uk_UA
+  if curl -fsSL "$DICT/uk_UA.aff" -o "$SPELL/uk_UA.aff" && curl -fsSL "$DICT/uk_UA.dic" -o "$SPELL/uk_UA.dic"; then
+    killall AppleSpell 2>/dev/null || true      # reload the system spell server
+  else
+    rm -f "$SPELL/uk_UA.aff" "$SPELL/uk_UA.dic"
+    echo "  ! download failed: Ukrainian words won't be recognised until you run ./build.sh again"
+  fi
+fi
+
 echo "→ Installing to /Applications"
 pkill -x kbswitch 2>/dev/null && sleep 0.5 || true
 rm -rf /Applications/KBSwitch.app
 ditto "$OUT" /Applications/KBSwitch.app
 open /Applications/KBSwitch.app
+sleep 1
+/Applications/KBSwitch.app/Contents/MacOS/kbswitch --check || true
 
 echo
-echo "✓ KBSwitch is installed and running (AЯ icon in the menu bar)."
+echo "✓ KBSwitch is installed and running (A/Я icon in the menu bar)."
 echo "  First time only: allow KBSwitch in System Settings → Privacy & Security → Accessibility."
