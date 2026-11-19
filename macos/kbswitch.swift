@@ -78,6 +78,7 @@ struct Config {
     var menuBarIcon = true
     var excludedApps: Set<String> = ["com.apple.Terminal", "com.googlecode.iterm2"]
     var debugLog = false
+    var transliteration = false
     var englishLayout = "auto"
     var ukrainianLayout = "auto"
     var exceptions = Set<String>()
@@ -106,6 +107,7 @@ struct Config {
             case "electron_accessibility": s.electronAccessibility = flag
             case "menu_bar_icon": s.menuBarIcon = flag
             case "debug_log": s.debugLog = flag
+            case "transliteration": s.transliteration = flag
             case "english_layout": s.englishLayout = value
             case "ukrainian_layout": s.ukrainianLayout = value
             case "excluded_apps":
@@ -135,6 +137,7 @@ struct Config {
         english_layout = \(englishLayout)
         ukrainian_layout = \(ukrainianLayout)
         debug_log = \(debugLog)
+        transliteration = \(transliteration)
 
         """
         try? FileManager.default.createDirectory(at: Files.dir, withIntermediateDirectories: true)
@@ -175,6 +178,19 @@ final class KeyLayout {
     }
 
     /// The single character this layout produces for the key, or nil (dead key, multi-char, error).
+    /// Which key (and Shift) types each character in this layout.
+    lazy var keyFor: [String: (code: UInt16, shift: Bool)] = {
+        var map: [String: (code: UInt16, shift: Bool)] = [:]
+        for code in UInt16(0)..<UInt16(51) {
+            for shift in [false, true] {
+                if let c = self.char(for: Key(code: code, shift: shift, caps: false, char: "")), map[c] == nil {
+                    map[c] = (code, shift)
+                }
+            }
+        }
+        return map
+    }()
+
     func char(for key: Key) -> String? {
         guard let bytes = CFDataGetBytePtr(uchr) else { return nil }
         let layout = UnsafeRawPointer(bytes).assumingMemoryBound(to: UCKeyboardLayout.self)
@@ -225,6 +241,50 @@ final class Layouts {
     static func currentID() -> String {
         guard let cur = TISCopyCurrentKeyboardLayoutInputSource()?.takeRetainedValue() else { return "?" }
         return (tisValue(cur, kTISPropertyInputSourceID) as? String) ?? "?"
+    }
+}
+
+// MARK: - Transliteration (optional): privit → привіт
+
+enum Translit {
+    /// Latin spellings and the Cyrillic they can stand for, most likely first. Casual and official
+    /// (KMU 2010) romanisations both occur, and the soft sign is usually left out (sohodni →
+    /// сьогодні), so several readings are tried against the dictionary.
+    private static let table: [(String, [String])] = [
+        ("shch", ["щ"]), ("sch", ["щ"]),
+        ("zh", ["ж"]), ("kh", ["х"]), ("ch", ["ч"]), ("sh", ["ш", "сх"]), ("ts", ["ц", "ць", "тс"]), ("tz", ["ц"]),
+        ("ya", ["я"]), ("ja", ["я"]), ("ia", ["я", "іа"]),
+        ("yu", ["ю"]), ("ju", ["ю"]), ("iu", ["ю", "іу"]),
+        ("ye", ["є"]), ("je", ["є"]), ("ie", ["є", "іе"]),
+        ("yi", ["ї"]), ("ji", ["ї"]), ("yo", ["йо"]), ("jo", ["йо"]),
+        ("a", ["а"]), ("b", ["б"]), ("c", ["ц", "к"]), ("d", ["д", "дь"]), ("e", ["е", "є"]), ("f", ["ф"]),
+        ("g", ["г", "ґ"]), ("h", ["г", "х"]), ("i", ["і", "и", "ї", "й"]), ("j", ["й"]), ("k", ["к"]),
+        ("l", ["л", "ль"]), ("m", ["м"]), ("n", ["н", "нь"]), ("o", ["о"]), ("p", ["п"]), ("q", ["к"]), ("r", ["р"]),
+        ("s", ["с", "сь"]), ("t", ["т", "ть"]), ("u", ["у"]), ("v", ["в"]), ("w", ["в"]), ("x", ["кс", "х"]),
+        ("y", ["и", "й"]), ("z", ["з", "зь"]), ("'", ["ь", "ʼ"]), ("`", ["ь"]),
+    ]
+    private static let maxTries = 400        // keeps the worst case to a few milliseconds
+
+    /// First reading of a lowercase Latin word that `isWord` accepts, or nil.
+    static func convert(_ latin: String, isWord: (String) -> Bool) -> String? {
+        let chars = Array(latin)
+        var tries = 0
+        var found: String?
+        func walk(_ i: Int, _ acc: String) {
+            if found != nil || tries >= maxTries { return }
+            if i == chars.count {
+                tries += 1
+                if isWord(acc) { found = acc }
+                return
+            }
+            for (latinPart, options) in table {
+                let p = Array(latinPart)
+                guard i + p.count <= chars.count, Array(chars[i ..< i + p.count]) == p else { continue }
+                for o in options { walk(i + p.count, acc + o); if found != nil { return } }
+            }
+        }
+        walk(0, "")
+        return found
     }
 }
 
@@ -715,6 +775,7 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let ukToEn = Decision.rejection(typed: ukText, converted: enText, fromLang: "uk", toLang: "en",
                                         minLength: settings.minLength, exceptions: exceptions, isWord: lexicon.isWord)
         if let a = enToUk, let b = ukToEn {
+            if settings.transliteration, transliterate(enChars, appID, proxy) { return true }
             return skip("en '\(enText)' / uk '\(ukText)': nothing to fix (en→uk: \(a); uk→en: \(b))")
         }
 
@@ -755,6 +816,60 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
                           word: Decision.core(typed), time: Date())
         // Remember the word as it now appears, so backspacing into it keeps working.
         pushWord(zip(buffer, newChars).map { Key(code: $0.code, shift: $0.shift, caps: $0.caps, char: $1) })
+        buffer.removeAll()
+        atWordStart = true
+        return true
+    }
+
+    /// Optional mode: a word typed in Latin that isn't English but reads as Ukrainian (privit → привіт).
+    /// Only in fields whose text can be read; the layout is left as it is.
+    private func transliterate(_ enChars: [String], _ appID: String, _ proxy: CGEventTapProxy) -> Bool {
+        func skip(_ why: String) -> Bool { DebugLog.write("translit skip: \(why)"); return false }
+        guard let uk = layouts.ukrainian, let en = layouts.english else { return false }
+        let enText = enChars.joined()
+        // Split off trailing punctuation typed with the English layout (privit, → привіт,).
+        let trail = String(enText.reversed().prefix(while: { ".,!?;:".contains($0) }).reversed())
+        let word = String(enText.dropLast(trail.count))
+        guard word.count >= settings.minLength,
+              word.allSatisfy({ ($0.isASCII && $0.isLetter) || $0 == "'" || $0 == "`" }),
+              let first = word.first, first.isLetter else { return skip("'\(enText)' is not a plain Latin word") }
+        let lower = word.lowercased(), upper = word.uppercased()
+        let capitalized = String(word.prefix(1)).uppercased() + String(word.dropFirst()).lowercased()
+        guard word == lower || word == upper || word == capitalized else { return skip("unusual casing '\(word)'") }
+        let exceptions = settings.exceptions.union(sessionIgnore)
+        guard !exceptions.contains(lower) else { return skip("'\(word)' is in exceptions") }
+        guard !lexicon.isWord(word, "en") else { return skip("'\(word)' is English") }
+        guard var cyr = Translit.convert(lower, isWord: { self.lexicon.isWord($0, "uk") }) else {
+            return skip("no Ukrainian reading of '\(word)'")
+        }
+        guard !exceptions.contains(cyr) else { return skip("'\(cyr)' is in exceptions") }
+        if word == upper { cyr = cyr.uppercased() } else if word == capitalized && word != lower {
+            cyr = String(cyr.prefix(1)).uppercased() + String(cyr.dropFirst())
+        }
+        let output = cyr + trail
+
+        // The field must really show the Latin word (typed in the English layout).
+        let field = FocusedField.check(expect: enText)
+        DebugLog.write("  translit '\(enText)' → '\(output)' · field: \(field) \(FocusedField.detail)")
+        guard field == .verified else { return skip("field check: \(field) in \(appID)") }
+        DebugLog.write("translit: '\(enText)' → '\(output)' in \(appID)")
+
+        for _ in buffer { post(UInt16(kVK_Delete), nil, shift: false, proxy) }
+        var newKeys: [Key] = []
+        for ch in output.map(String.init) {
+            if let k = uk.keyFor[ch] {
+                post(k.code, ch, shift: k.shift, proxy)
+                newKeys.append(Key(code: k.code, shift: k.shift, caps: false, char: ch))
+            } else {
+                post(0, ch, shift: false, proxy)
+            }
+        }
+        post(UInt16(kVK_Space), " ", shift: false, proxy)
+
+        let typedKeys = zip(buffer, enChars).map { Key(code: $0.code, shift: $0.shift, caps: $0.caps, char: $1) }
+        last = Correction(typed: typedKeys, inserted: output, from: en.source, word: word, time: Date())
+        // Backspacing into the result only works if every character came from a real key.
+        if newKeys.count == output.count { pushWord(newKeys) } else { history.removeAll() }
         buffer.removeAll()
         atWordStart = true
         return true
@@ -975,6 +1090,7 @@ struct SettingsView: View {
                     Text("Off").tag("none")
                 }
                 Toggle("Never convert undone words again", isOn: $model.config.learnOnUndo)
+                Toggle("Ukrainian typed in Latin → Cyrillic (privit → привіт)", isOn: $model.config.transliteration)
             }
             Section {
                 TextEditor(text: $model.exceptions)

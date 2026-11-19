@@ -73,6 +73,11 @@ A small native window: enable/disable, start at login, show in menu bar, minimum
 only-in-text-fields, undo key, a "Never convert" word list and a list of ignored apps (Terminal and iTerm
 by default). Changes apply instantly.
 
+**Optional: Ukrainian typed in Latin.** Turn on *Ukrainian typed in Latin → Cyrillic* and words like
+`privit`, `dyakuyu` or `dobryi` become **привіт**, **дякую**, **добрий** when you press Space. It only
+fires for words that aren't English and have a dictionary-valid Ukrainian reading, it keeps your layout,
+and **Esc** undoes it. Off by default.
+
 If a word isn't fixed and you don't know why, choose **Diagnostic Log** in the menu, reproduce it,
 then choose **Show Log**. Every key, every forgotten word and every skipped correction is logged
 with its reason. The log contains what you typed, so turn it off afterwards.
