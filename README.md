@@ -38,9 +38,6 @@ restart is needed.
 
 That's it. The **ЯR** icon appears in the menu bar, and the app starts automatically at every login.
 
-> The very first build creates a local signing certificate in your keychain. macOS may ask once
-> to let `codesign` use it: click **Always Allow**.
-
 ## Update
 
 ```bash

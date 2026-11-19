@@ -5,7 +5,7 @@
 #   ./build.sh --ci     build only (into ./build), ad-hoc signed; used by GitHub Actions
 #
 # Signing: the app is signed with a self-signed certificate "KBSwitch Local Signing" that this
-# script creates once in your login keychain. Because the signing identity never changes, macOS
+# script creates once in its own keychain (no password prompts). Because the signing identity never changes, macOS
 # keeps the Accessibility permission across rebuilds, so you are asked for it only once.
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -48,7 +48,16 @@ if $CI; then
 fi
 
 echo "→ Signing"
-if ! security find-identity -p codesigning | grep -q "$CERT"; then
+# The signing key lives in its own small keychain with a fixed password, so codesign can use it
+# without ever asking for your login password. It only holds this self-signed key.
+KC="$HOME/Library/Keychains/kbswitch-signing.keychain-db"
+KCPASS=kbswitch
+if [ ! -f "$KC" ]; then
+  security create-keychain -p "$KCPASS" "$KC"
+  security set-keychain-settings "$KC"                    # never auto-lock
+fi
+security unlock-keychain -p "$KCPASS" "$KC"
+if ! security find-identity -p codesigning "$KC" | grep -q "$CERT"; then
   echo "  creating signing certificate '$CERT' (one time)"
   TMP=$(mktemp -d)
   cat > "$TMP/cert.cfg" <<EOF
@@ -67,12 +76,12 @@ EOF
       -keyout "$TMP/key.pem" -out "$TMP/cert.pem" 2>/dev/null
   /usr/bin/openssl pkcs12 -export -inkey "$TMP/key.pem" -in "$TMP/cert.pem" -name "$CERT" \
       -out "$TMP/id.p12" -passout pass:kbswitch
-  security import "$TMP/id.p12" -k "$HOME/Library/Keychains/login.keychain-db" \
-      -P kbswitch -T /usr/bin/codesign >/dev/null
+  security import "$TMP/id.p12" -k "$KC" -P kbswitch -T /usr/bin/codesign >/dev/null
+  security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KCPASS" "$KC" >/dev/null
   rm -rf "$TMP"
 fi
-if ! codesign --force --sign "$CERT" "$OUT" 2>/dev/null; then
-  echo "  ! could not use '$CERT' (keychain refused?): falling back to ad-hoc signing."
+if ! codesign --force --keychain "$KC" --sign "$CERT" "$OUT" 2>/dev/null; then
+  echo "  ! could not sign with '$CERT': falling back to ad-hoc signing."
   echo "    The app works, but macOS will ask for Accessibility again after each rebuild."
   codesign --force --sign - "$OUT"
 fi
