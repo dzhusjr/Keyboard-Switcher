@@ -748,7 +748,8 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         reloadIfChanged()
         func skip(_ why: String) -> Bool { DebugLog.write("skip: \(why)"); return false }
         guard active else { return false }
-        guard buffer.count >= settings.minLength, buffer.count <= settings.maxLength else {
+        let shortest = settings.transliteration ? 1 : settings.minLength   // translit: я, ти, і, в…
+        guard buffer.count >= shortest, buffer.count <= settings.maxLength else {
             return skip("length \(buffer.count) outside \(settings.minLength)…\(settings.maxLength)")
         }
         // "Writing Ukrainian in Latin" lasts only while each word keeps being transliterated.
@@ -837,7 +838,8 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func ukrainianReading(of enText: String, allowEnglish: Bool, why: inout String) -> (output: String, word: String)? {
         let trail = String(enText.reversed().prefix(while: { ".,!?;:".contains($0) }).reversed())
         let word = String(enText.dropLast(trail.count))
-        guard word.count >= settings.minLength,
+        // Short words: two letters always (ya → я), one letter only mid-sentence (i → і, v → в).
+        guard word.count >= (allowEnglish ? 1 : 2),
               word.allSatisfy({ ($0.isASCII && $0.isLetter) || $0 == "'" || $0 == "`" }),
               let first = word.first, first.isLetter else { why = "'\(enText)' is not a plain Latin word"; return nil }
         let lower = word.lowercased(), upper = word.uppercased()
@@ -1191,6 +1193,13 @@ let engine = Engine()
 app.delegate = engine
 if CommandLine.arguments.contains("--unregister") {   // used by uninstall.sh
     try? SMAppService.mainApp.unregister()
+    exit(0)
+}
+if let i = CommandLine.arguments.firstIndex(of: "--spell") {      // kbswitch --spell word…
+    let lexicon = Lexicon()
+    for w in CommandLine.arguments.dropFirst(i + 1) {
+        print("\(w): en=\(lexicon.isWord(w, "en")) uk=\(lexicon.isWord(w, "uk"))")
+    }
     exit(0)
 }
 if CommandLine.arguments.contains("--check") {
