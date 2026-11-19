@@ -683,7 +683,7 @@ final class Engine: NSObject, NSApplicationDelegate {
                 icon.isTemplate = true                     // adapts to light/dark menu bar
                 item.button?.image = icon
             } else {
-                item.button?.title = "A/Я"
+                item.button?.title = "ЯR"
             }
             let menu = NSMenu()
             func add(_ title: String, _ action: Selector, tag: Int = 0) {

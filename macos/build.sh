@@ -100,5 +100,5 @@ sleep 1
 /Applications/KBSwitch.app/Contents/MacOS/kbswitch --check || true
 
 echo
-echo "✓ KBSwitch is installed and running (A/Я icon in the menu bar)."
+echo "✓ KBSwitch is installed and running (ЯR icon in the menu bar)."
 echo "  First time only: allow KBSwitch in System Settings → Privacy & Security → Accessibility."

@@ -36,7 +36,7 @@ dictionary into `~/Library/Spelling`. That also gives you Ukrainian spell-check 
 Security → Accessibility* and switch **KBSwitch** on. It starts working within 2 seconds. No
 restart is needed.
 
-That's it. The **A/Я** icon appears in the menu bar, and the app starts automatically at every login.
+That's it. The **ЯR** icon appears in the menu bar, and the app starts automatically at every login.
 
 > The very first build creates a local signing certificate in your keychain. macOS may ask once
 > to let `codesign` use it: click **Always Allow**.
@@ -63,7 +63,7 @@ Just type. When a word was typed in the wrong layout, pressing **Space** replace
 the layout.
 
 - **Esc** right after a correction undoes it, and the word is never converted again.
-- **Menu-bar icon (A/Я):** Enabled · Settings… · Quit. If you hide the icon, open KBSwitch from
+- **Menu-bar icon (ЯR):** Enabled · Settings… · Quit. If you hide the icon, open KBSwitch from
   Applications or Spotlight to get the settings back.
 
 ### Settings
