@@ -20,7 +20,16 @@ command -v swiftc >/dev/null || { echo "✗ swiftc not found. Run:  xcode-select
 echo "→ Compiling"
 rm -rf build && mkdir -p "$OUT/Contents/MacOS" "$OUT/Contents/Resources"
 swiftc -O -swift-version 5 kbswitch.swift -o "$OUT/Contents/MacOS/kbswitch"
-cp Resources/AppIcon.icns Resources/MenuBarIcon.png Resources/MenuBarIcon@2x.png "$OUT/Contents/Resources/"
+cp Resources/MenuBarIcon.png Resources/MenuBarIcon@2x.png "$OUT/Contents/Resources/"
+# App icon: built from AppIcon.png with Apple's own tools so Finder/Spotlight/Dock read it reliably.
+ICONSET=$(mktemp -d)/AppIcon.iconset
+mkdir -p "$ICONSET"
+for sz in 16 32 128 256 512; do
+  sips -z $sz $sz Resources/AppIcon.png --out "$ICONSET/icon_${sz}x${sz}.png" >/dev/null
+  sips -z $((sz*2)) $((sz*2)) Resources/AppIcon.png --out "$ICONSET/icon_${sz}x${sz}@2x.png" >/dev/null
+done
+iconutil -c icns "$ICONSET" -o "$OUT/Contents/Resources/AppIcon.icns" 2>/dev/null \
+  || cp Resources/AppIcon.icns "$OUT/Contents/Resources/AppIcon.icns"
 
 cat > "$OUT/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -31,6 +40,7 @@ cat > "$OUT/Contents/Info.plist" <<EOF
   <key>CFBundleDisplayName</key><string>KBSwitch</string>
   <key>CFBundleExecutable</key><string>kbswitch</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
+  <key>CFBundleIconName</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>2.0</string>
   <key>CFBundleVersion</key><string>2.0</string>
@@ -104,6 +114,11 @@ echo "→ Installing to /Applications"
 pkill -x kbswitch 2>/dev/null && sleep 0.5 || true
 rm -rf /Applications/KBSwitch.app
 ditto "$OUT" /Applications/KBSwitch.app
+# Make Finder/Spotlight/Launchpad pick up the (new) icon instead of a cached blank one.
+touch /Applications/KBSwitch.app
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
+  -f /Applications/KBSwitch.app 2>/dev/null || true
+rm -rf build          # don't leave a second copy for Spotlight to find
 open /Applications/KBSwitch.app
 sleep 1
 /Applications/KBSwitch.app/Contents/MacOS/kbswitch --check || true
