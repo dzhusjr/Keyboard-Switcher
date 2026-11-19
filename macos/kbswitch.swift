@@ -50,6 +50,10 @@ enum Files {
 enum DebugLog {
     static let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/KBSwitch.log")
     static var on = false
+    /// Starts a fresh log with a header describing the setup.
+    static func start(_ header: String) {
+        try? ("KBSwitch diagnostic log\n" + header + "\n").data(using: .utf8)?.write(to: url)
+    }
     static func write(_ message: String) {
         guard on, let data = "\(Date()) \(message)\n".data(using: .utf8) else { return }
         if let h = try? FileHandle(forWritingTo: url) { h.seekToEndOfFile(); h.write(data); try? h.close() }
@@ -205,16 +209,22 @@ final class Layouts {
         if ukrainian == nil { logLine("no Ukrainian layout enabled (or ukrainian_layout id not found)") }
     }
 
-    /// (current layout, layout to convert into), or nil if the current layout is neither language.
-    func pair() -> (from: KeyLayout, to: KeyLayout)? {
-        guard let cur = TISCopyCurrentKeyboardLayoutInputSource()?.takeRetainedValue(),
-              let from = KeyLayout(cur) else { return nil }
-        switch from.lang {
-        case "en": if let to = ukrainian { return (from, to) }
-        case "uk": if let to = english { return (from, to) }
-        default: break
+    /// Which layout the keys were typed in, decided from the characters they actually produced
+    /// (macOS's "current layout" can be stale for a background app right after a manual switch).
+    func pair(for keys: [Key]) -> (from: KeyLayout, to: KeyLayout)? {
+        guard let en = english, let uk = ukrainian else { return nil }
+        let inEnglish = keys.allSatisfy { en.char(for: $0) == $0.char }
+        let inUkrainian = keys.allSatisfy { uk.char(for: $0) == $0.char }
+        switch (inEnglish, inUkrainian) {
+        case (true, false): return (en, uk)
+        case (false, true): return (uk, en)
+        default: return nil            // ambiguous, or typed in some other layout
         }
-        return nil
+    }
+
+    static func currentID() -> String {
+        guard let cur = TISCopyCurrentKeyboardLayoutInputSource()?.takeRetainedValue() else { return "?" }
+        return (tisValue(cur, kTISPropertyInputSourceID) as? String) ?? "?"
     }
 }
 
@@ -283,28 +293,34 @@ enum Decision {
         }
     }
 
-    static func shouldConvert(typed: String, converted: String, fromLang: String, toLang: String,
-                              minLength: Int, exceptions: Set<String>,
-                              isWord: (String, String) -> Bool) -> Bool {
-        guard typed != converted, !typed.contains(where: { $0.isNumber }) else { return false }
+    /// nil = convert; otherwise the reason not to (used for the diagnostic log).
+    static func rejection(typed: String, converted: String, fromLang: String, toLang: String,
+                          minLength: Int, exceptions: Set<String>,
+                          isWord: (String, String) -> Bool) -> String? {
+        if typed == converted { return "same text in both layouts" }
+        if typed.contains(where: { $0.isNumber }) { return "contains digits" }
         let src = core(typed), dst = core(converted)
-        guard !src.isEmpty, dst.count >= minLength else { return false }
+        if src.isEmpty { return "only punctuation" }
+        if dst.count < minLength { return "result '\(dst)' shorter than \(minLength)" }
 
         // The result must be a clean word in the target script (letters, inner apostrophe/hyphen).
         guard let first = dst.first, let last = dst.last,
               isLetter(first, toLang), isLetter(last, toLang),
-              dst.allSatisfy({ isLetter($0, toLang) || innerMarks.contains($0) }) else { return false }
-
+              dst.allSatisfy({ isLetter($0, toLang) || innerMarks.contains($0) }) else {
+            return "result '\(dst)' is not a clean \(toLang) word"
+        }
         // Natural casing only: word, Word or WORD.
         let letters = dst.filter { $0.isLetter }
         let capitalized = letters.prefix(1).uppercased() + letters.dropFirst().lowercased()
         guard letters == letters.lowercased() || letters == letters.uppercased() || letters == capitalized
-        else { return false }
+        else { return "unusual casing '\(dst)'" }
 
-        for w in [typed, src, dst] where exceptions.contains(w.lowercased()) { return false }
+        for w in [typed, src, dst] where exceptions.contains(w.lowercased()) { return "'\(w)' is in exceptions" }
 
         // Strict rule: what you typed is not a word, and what it becomes is a word.
-        return !isWord(src, fromLang) && isWord(dst, toLang)
+        if isWord(src, fromLang) { return "'\(src)' is a real \(fromLang) word" }
+        if !isWord(dst, toLang) { return "'\(dst)' is not a \(toLang) word" }
+        return nil
     }
 }
 
@@ -323,7 +339,10 @@ enum FocusedField {
 
     /// Checks that the focused element is an editable text field and that the text right before
     /// the caret is exactly `word`, preceded by whitespace / an opening bracket / start of text.
+    static var detail = ""         // what the last check saw (diagnostic log)
+
     static func check(expect word: String) -> FieldState {
+        detail = ""
         let system = AXUIElementCreateSystemWide()
         AXUIElementSetMessagingTimeout(system, 0.08)
         guard let f = attr(system, kAXFocusedUIElementAttribute),
@@ -336,6 +355,7 @@ enum FocusedField {
         var settable = DarwinBoolean(false)
         let editable = AXUIElementIsAttributeSettable(el, kAXValueAttribute as CFString, &settable) == .success
             && settable.boolValue
+        detail = "role=\(role) editable=\(editable)"
         guard textRoles.contains(role) || editable else { return .notText }
 
         // Apps draw keystrokes asynchronously: when typing fast the last letters may not be in the
@@ -359,7 +379,10 @@ enum FocusedField {
         let start = sel.location - word.utf16.count
         guard start >= 0 else { return .mismatch }
         let from = max(0, start - 1)
-        guard let text = string(el, CFRange(location: from, length: sel.location - from)) else { return .unverified }
+        guard let text = string(el, CFRange(location: from, length: sel.location - from)) else {
+            detail += " caret=\(sel.location) text=unreadable"; return .unverified
+        }
+        detail += " caret=\(sel.location) before-caret='\(text)'"
         guard text.hasSuffix(word) else { return .mismatch }
         let before = text.dropLast(word.count)
         if before.isEmpty { return start == 0 ? .verified : .mismatch }
@@ -471,13 +494,14 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         tap = t
         CFRunLoopAddSource(CFRunLoopGetMain(), CFMachPortCreateRunLoopSource(kCFAllocatorDefault, t, 0), .commonModes)
         CGEvent.tapEnable(tap: t, enable: true)
+        DebugLog.write("event tap installed")
         return true
     }
 
     private func observeSystem() {
         NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] note in
-            self?.reset()
+            self?.reset("switched app")
             if let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
                 self?.exposeElectron(app)
             }
@@ -487,8 +511,10 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         object: nil, queue: .main) { [weak self] _ in
             // The user changed layout mid-word: the tracked keys no longer describe the text.
             // Our own switch after a fix is ignored (keys typed since then are re-checked anyway).
-            guard let self = self, Date() > self.ownSwitchUntil, !self.buffer.isEmpty else { return }
-            self.buffer.removeAll(); self.atWordStart = false; self.history.removeAll()
+            guard let self = self else { return }
+            let own = Date() <= self.ownSwitchUntil
+            DebugLog.write("layout changed to \(Layouts.currentID())\(own ? " (by KBSwitch)" : " (by you)")")
+            // Nothing to discard: keys are matched against both layouts when Space is pressed.
         }
         dnc.addObserver(forName: Notification.Name(kTISNotifyEnabledKeyboardInputSourcesChanged as String),
                         object: nil, queue: .main) { [weak self] _ in
@@ -510,16 +536,35 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let now = [Files.modified(Files.settings), Files.modified(Files.exceptions)]
         guard force || now != stamps else { return }
         settings = Config.load()
+        let wasLogging = DebugLog.on
         DebugLog.on = settings.debugLog
         stamps = [Files.modified(Files.settings), Files.modified(Files.exceptions)]
         layouts.reload(settings)
         lexicon.reloadWordLists()
+        if DebugLog.on && !wasLogging { DebugLog.start(diagnostics()) }
         updateMenu()
+    }
+
+    private func diagnostics() -> String {
+        let v = ProcessInfo.processInfo.operatingSystemVersionString
+        let app = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+        return """
+        macOS \(v) · KBSwitch \(app)
+        English layout: \(layouts.english?.id ?? "NOT FOUND") · Ukrainian layout: \(layouts.ukrainian?.id ?? "NOT FOUND") · current: \(Layouts.currentID())
+        en: \(lexicon.describe("en")) · uk: \(lexicon.describe("uk"))
+        Accessibility: \(AXIsProcessTrusted()) · event tap: \(tap != nil) · secure input: \(IsSecureEventInputEnabled() == true)
+        min=\(settings.minLength) max=\(settings.maxLength) undo=\(settings.undoKey) textFieldsOnly=\(settings.requireTextField) excluded=\(settings.excludedApps.sorted())
+        """
     }
 
     // MARK: Event handling
 
-    private func reset() { buffer.removeAll(); atWordStart = false; last = nil; history.removeAll() }
+    private func reset(_ why: String) {
+        if DebugLog.on, !buffer.isEmpty || !history.isEmpty || atWordStart {
+            DebugLog.write("forget word ('\(buffer.map(\.char).joined())'): \(why)")
+        }
+        buffer.removeAll(); atWordStart = false; last = nil; history.removeAll()
+    }
 
     private var ownSwitchUntil = Date.distantPast
 
@@ -540,15 +585,15 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .tapDisabledByTimeout, .tapDisabledByUserInput:
             if let t = tap { CGEvent.tapEnable(tap: t, enable: true) }
             DebugLog.write("event tap was disabled by macOS (\(type.rawValue)); re-enabled")
-            reset(); return pass
+            reset("event tap re-enabled"); return pass
         default:                                   // mouse click: the caret may have moved
-            reset(); return pass
+            reset("mouse click"); return pass
         }
         if event.getIntegerValueField(.eventSourceUserData) == Engine.marker { return pass }
 
         let pending = last
         last = nil
-        guard active else { reset(); return pass }
+        guard active else { reset("disabled"); return pass }
 
         let code = Int(event.getIntegerValueField(.keyboardEventKeycode))
         let flags = event.flags
@@ -559,27 +604,39 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
            Date().timeIntervalSince(p.time) < 10, undo(p, proxy) {
             return nil
         }
-        if shortcut { reset(); return pass }      // shortcuts are not typing
+        if shortcut {
+            // ⌃Space / ⌃⌥Space etc. switch the layout: the cursor doesn't move, so keep the word.
+            // (Keys from two layouts in one word are rejected later anyway.)
+            if code == kVK_Space { DebugLog.write("modifier+Space (layout switch?): keeping word"); return pass }
+            reset("shortcut ⌘/⌃/⌥ + key \(code)"); return pass                     // shortcuts are not typing
+        }
 
+        defer {
+            if DebugLog.on {
+                DebugLog.write("key \(code)\(isRepeat ? " (held)" : "") → word='\(buffer.map(\.char).joined())' wordStartSeen=\(atWordStart) history=\(history.count) layout=\(Layouts.currentID())")
+            }
+        }
         switch code {
         case kVK_Space:
-            if isRepeat { reset(); atWordStart = true; return pass }
+            if isRepeat { reset("held Space"); atWordStart = true; return pass }
             if !buffer.isEmpty, correct(proxy) { return nil }
             pushWord(buffer)
             buffer.removeAll(); atWordStart = true
         case kVK_Delete:
-            if isRepeat { reset() }
+            if isRepeat { reset("held Backspace") }
             else if !buffer.isEmpty { buffer.removeLast() }
             else if let prev = history.popLast() {           // deleted a Space: back into the previous word
                 buffer = prev.keys; atWordStart = prev.atStart
+                DebugLog.write("backspace over Space: back into '\(buffer.map(\.char).joined())'")
             }
             else { atWordStart = false }                     // deleting into text we never saw
         case kVK_Return, kVK_ANSI_KeypadEnter:
-            buffer.removeAll(); atWordStart = true
+            // A new line starts, or a message was sent: earlier words can't be returned to safely.
+            buffer.removeAll(); history.removeAll(); atWordStart = true
         default:
             // Arrows, F-keys, Tab, Esc, held keys, over-long words: not part of a word we can trust.
             guard !isRepeat, let ch = printable(event), buffer.count < settings.maxLength else {
-                reset(); return pass
+                reset(isRepeat ? "held key" : "non-typing key \(code)"); return pass
             }
             buffer.append(Key(code: UInt16(code), shift: flags.contains(.maskShift),
                               caps: flags.contains(.maskAlphaShift), char: ch))
@@ -618,34 +675,32 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         let appID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "?"
         if settings.excludedApps.contains(appID) { return skip("excluded app \(appID)") }
-        guard let pair = layouts.pair() else { return skip("current layout is not English/Ukrainian, or the other one is not enabled") }
+        guard let pair = layouts.pair(for: buffer) else {
+            return skip("keys don't match exactly one of \(layouts.english?.id ?? "no English layout") / \(layouts.ukrainian?.id ?? "no Ukrainian layout") (macOS says current = \(Layouts.currentID()))")
+        }
         guard lexicon.supports(pair.from.lang), lexicon.supports(pair.to.lang) else {
             return skip("no dictionary — en: \(lexicon.describe("en")); uk: \(lexicon.describe("uk"))")
         }
 
-        var typed = "", converted = ""
         var newChars: [String] = []
         for key in buffer {
-            // Re-deriving each char through the current layout must reproduce what was typed
-            // (guards against dead keys, input methods, remapping tools); otherwise do nothing.
-            guard pair.from.char(for: key) == key.char, let c = pair.to.char(for: key) else {
-                return skip("key \(key.code) does not map cleanly in \(pair.from.id)/\(pair.to.id)")
-            }
-            typed += key.char
-            converted += c
+            guard let c = pair.to.char(for: key) else { return skip("key \(key.code) has no character in \(pair.to.id)") }
             newChars.append(c)
         }
+        let typed = buffer.map(\.char).joined()
+        let converted = newChars.joined()
 
-        guard Decision.shouldConvert(typed: typed, converted: converted,
-                                     fromLang: pair.from.lang, toLang: pair.to.lang,
-                                     minLength: settings.minLength,
-                                     exceptions: settings.exceptions.union(sessionIgnore),
-                                     isWord: lexicon.isWord) else {
-            return skip("'\(typed)' → '\(converted)': typed is a word, or result is not a word (\(pair.to.lang))")
+        if let why = Decision.rejection(typed: typed, converted: converted,
+                                        fromLang: pair.from.lang, toLang: pair.to.lang,
+                                        minLength: settings.minLength,
+                                        exceptions: settings.exceptions.union(sessionIgnore),
+                                        isWord: lexicon.isWord) {
+            return skip("'\(typed)' → '\(converted)': \(why)")
         }
 
         // Only touch the text if we are sure it is exactly the word we tracked.
         let field = FocusedField.check(expect: typed)
+        DebugLog.write("  field: \(field) \(FocusedField.detail) wordStartSeen=\(atWordStart)")
         switch field {
         case .verified: break
         case .unverified: guard atWordStart else { return skip("text unreadable in \(appID) and word start not seen") }
@@ -738,6 +793,8 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
             add("Enabled", #selector(toggleEnabled), tag: 1)
             menu.addItem(NSMenuItem.separator())
             add("Settings…", #selector(openSettings))
+            add("Diagnostic Log", #selector(toggleLog), tag: 5)
+            add("Show Log", #selector(showLog), tag: 6)
             menu.addItem(NSMenuItem.separator())
             add("Quit KBSwitch", #selector(quit))
             item.menu = menu
@@ -746,6 +803,8 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let trusted = AXIsProcessTrusted()
         statusItem?.button?.appearsDisabled = !active || !trusted
         statusItem?.menu?.item(withTag: 3)?.isHidden = trusted
+        statusItem?.menu?.item(withTag: 5)?.state = settings.debugLog ? .on : .off
+        statusItem?.menu?.item(withTag: 6)?.isHidden = !settings.debugLog
         let secureInput: Bool = IsSecureEventInputEnabled() == true   // compiles whether Bool or DarwinBoolean
         statusItem?.menu?.item(withTag: 4)?.isHidden = !secureInput
         statusItem?.menu?.item(withTag: 1)?.state = active ? .on : .off
@@ -755,11 +814,20 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var c = Config.load()
         c.enabled.toggle()
         c.save()
-        reset()
+        reset("toggled Enabled")
         reloadIfChanged(force: true)
     }
 
     @objc private func quit() { NSApp.terminate(nil) }
+
+    @objc private func toggleLog() {
+        var c = Config.load()
+        c.debugLog.toggle()
+        c.save()
+        reloadIfChanged(force: true)
+    }
+
+    @objc private func showLog() { NSWorkspace.shared.open(DebugLog.url) }
 
     func menuWillOpen(_ menu: NSMenu) { updateMenu() }
 

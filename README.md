@@ -64,7 +64,7 @@ Just type. When a word was typed in the wrong layout, pressing **Space** replace
 the layout.
 
 - **Esc** right after a correction undoes it, and the word is never converted again.
-- **Menu-bar icon (ЯR):** Enabled · Settings… · Quit. If you hide the icon, open KBSwitch from
+- **Menu-bar icon (ЯR):** Enabled · Settings… · Diagnostic Log · Quit. If you hide the icon, open KBSwitch from
   Applications or Spotlight to get the settings back.
 
 ### Settings
@@ -73,8 +73,9 @@ A small native window: enable/disable, start at login, show in menu bar, minimum
 only-in-text-fields, undo key, a "Never convert" word list and a list of ignored apps (Terminal and iTerm
 by default). Changes apply instantly.
 
-If a word isn't fixed and you don't know why, turn on **Write diagnostic log** and check
-`~/Library/Logs/KBSwitch.log`.
+If a word isn't fixed and you don't know why, choose **Diagnostic Log** in the menu, reproduce it,
+then choose **Show Log**. Every key, every forgotten word and every skipped correction is logged
+with its reason. The log contains what you typed, so turn it off afterwards.
 
 ### When does it replace a word?
 
