@@ -101,7 +101,7 @@ struct Config {
             case "enabled": s.enabled = flag
             case "min_length": s.minLength = max(1, Int(value) ?? s.minLength)
             case "max_length": s.maxLength = max(1, Int(value) ?? s.maxLength)
-            case "undo_key": s.undoKey = value.lowercased() == "none" ? "none" : "escape"
+            case "undo_key": s.undoKey = ["none", "backspace"].contains(value.lowercased()) ? value.lowercased() : "escape"
             case "learn_on_undo": s.learnOnUndo = flag
             case "require_text_field": s.requireTextField = flag
             case "electron_accessibility": s.electronAccessibility = flag
@@ -482,7 +482,7 @@ struct Correction {
     let typed: [Key]
     let inserted: String
     let from: TISInputSource
-    let word: String
+    let words: [String]       // the original word(s), for exceptions when undone
     let time: Date
 }
 
@@ -630,6 +630,7 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: Event handling
 
     private func reset(_ why: String) {
+        translitStreak = false
         if DebugLog.on, !buffer.isEmpty || !history.isEmpty || atWordStart {
             DebugLog.write("forget word \(spell(buffer)): \(why)")
         }
@@ -678,7 +679,7 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let shortcut = !flags.intersection([.maskCommand, .maskControl, .maskAlternate]).isEmpty
 
         if let p = pending, !isRepeat, !shortcut, isUndoKey(code),
-           Date().timeIntervalSince(p.time) < 10, undo(p, proxy) {
+           Date().timeIntervalSince(p.time) < 10, undo(p, proxy, learn: code == kVK_Escape) {
             return nil
         }
         if shortcut {
@@ -724,6 +725,7 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func isUndoKey(_ code: Int) -> Bool {
         switch settings.undoKey {
         case "escape": return code == kVK_Escape
+        case "backspace": return code == kVK_Delete
         default: return false
         }
     }
@@ -749,6 +751,9 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard buffer.count >= settings.minLength, buffer.count <= settings.maxLength else {
             return skip("length \(buffer.count) outside \(settings.minLength)…\(settings.maxLength)")
         }
+        // "Writing Ukrainian in Latin" lasts only while each word keeps being transliterated.
+        let streak = translitStreak
+        translitStreak = false
         let appID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "?"
         if settings.excludedApps.contains(appID) { return skip("excluded app \(appID)") }
         guard let en = layouts.english, let uk = layouts.ukrainian else {
@@ -775,7 +780,7 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let ukToEn = Decision.rejection(typed: ukText, converted: enText, fromLang: "uk", toLang: "en",
                                         minLength: settings.minLength, exceptions: exceptions, isWord: lexicon.isWord)
         if let a = enToUk, let b = ukToEn {
-            if settings.transliteration, transliterate(enChars, appID, proxy) { return true }
+            if settings.transliteration, transliterate(enChars, appID, streak: streak, proxy) { return true }
             return skip("en '\(enText)' / uk '\(ukText)': nothing to fix (en→uk: \(a); uk→en: \(b))")
         }
 
@@ -787,6 +792,8 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .verified:
             typedInEnglish = FocusedField.matched == 0
             if let why = typedInEnglish ? enToUk : ukToEn {
+                // A Latin word that is fine as English may still be transliterated (in context).
+                if typedInEnglish, settings.transliteration, transliterate(enChars, appID, streak: streak, proxy) { return true }
                 return skip("'\(typedInEnglish ? enText : ukText)' is on screen and is fine: \(why)")
             }
         case .unverified, .unknown, .notText:
@@ -813,7 +820,8 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         selectLayout(pair.to.source)
 
         last = Correction(typed: buffer, inserted: converted, from: pair.from.source,
-                          word: Decision.core(typed), time: Date())
+                          words: [Decision.core(typed)], time: Date())
+        translitStreak = false
         // Remember the word as it now appears, so backspacing into it keeps working.
         pushWord(zip(buffer, newChars).map { Key(code: $0.code, shift: $0.shift, caps: $0.caps, char: $1) })
         buffer.removeAll()
@@ -821,62 +829,102 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return true
     }
 
-    /// Optional mode: a word typed in Latin that isn't English but reads as Ukrainian (privit → привіт).
-    /// Only in fields whose text can be read; the layout is left as it is.
-    private func transliterate(_ enChars: [String], _ appID: String, _ proxy: CGEventTapProxy) -> Bool {
-        func skip(_ why: String) -> Bool { DebugLog.write("translit skip: \(why)"); return false }
-        guard let uk = layouts.ukrainian, let en = layouts.english else { return false }
-        let enText = enChars.joined()
-        // Split off trailing punctuation typed with the English layout (privit, → привіт,).
+    /// The previous word was transliterated: you're writing Ukrainian in Latin right now.
+    private var translitStreak = false
+
+    /// Cyrillic reading of a Latin word typed with the English layout (trailing punctuation kept),
+    /// or nil with the reason in `why`.
+    private func ukrainianReading(of enText: String, allowEnglish: Bool, why: inout String) -> (output: String, word: String)? {
         let trail = String(enText.reversed().prefix(while: { ".,!?;:".contains($0) }).reversed())
         let word = String(enText.dropLast(trail.count))
         guard word.count >= settings.minLength,
               word.allSatisfy({ ($0.isASCII && $0.isLetter) || $0 == "'" || $0 == "`" }),
-              let first = word.first, first.isLetter else { return skip("'\(enText)' is not a plain Latin word") }
+              let first = word.first, first.isLetter else { why = "'\(enText)' is not a plain Latin word"; return nil }
         let lower = word.lowercased(), upper = word.uppercased()
         let capitalized = String(word.prefix(1)).uppercased() + String(word.dropFirst()).lowercased()
-        guard word == lower || word == upper || word == capitalized else { return skip("unusual casing '\(word)'") }
+        guard word == lower || word == upper || word == capitalized else { why = "unusual casing '\(word)'"; return nil }
         let exceptions = settings.exceptions.union(sessionIgnore)
-        guard !exceptions.contains(lower) else { return skip("'\(word)' is in exceptions") }
-        guard !lexicon.isWord(word, "en") else { return skip("'\(word)' is English") }
+        guard !exceptions.contains(lower) else { why = "'\(word)' is in exceptions"; return nil }
+        if !allowEnglish && lexicon.isWord(word, "en") { why = "'\(word)' is English"; return nil }
         guard var cyr = Translit.convert(lower, isWord: { self.lexicon.isWord($0, "uk") }) else {
-            return skip("no Ukrainian reading of '\(word)'")
+            why = "no Ukrainian reading of '\(word)'"; return nil
         }
-        guard !exceptions.contains(cyr) else { return skip("'\(cyr)' is in exceptions") }
+        guard !exceptions.contains(cyr) else { why = "'\(cyr)' is in exceptions"; return nil }
         if word == upper { cyr = cyr.uppercased() } else if word == capitalized && word != lower {
             cyr = String(cyr.prefix(1)).uppercased() + String(cyr.dropFirst())
         }
-        let output = cyr + trail
+        return (cyr + trail, word)
+    }
 
-        // The field must really show the Latin word (typed in the English layout).
-        let field = FocusedField.check(expect: enText)
-        DebugLog.write("  translit '\(enText)' → '\(output)' · field: \(field) \(FocusedField.detail)")
-        guard field == .verified else { return skip("field check: \(field) in \(appID)") }
-        DebugLog.write("translit: '\(enText)' → '\(output)' in \(appID)")
+    /// Optional mode: a word typed in Latin that reads as Ukrainian (privit → привіт). Words that are
+    /// also English (yak → як) are converted only in context: right after a converted word, or
+    /// together with the next word once that one converts. Only in fields whose text can be read;
+    /// the layout is left as it is.
+    private func transliterate(_ enChars: [String], _ appID: String, streak: Bool, _ proxy: CGEventTapProxy) -> Bool {
+        func skip(_ why: String) -> Bool { DebugLog.write("translit skip: \(why)"); return false }
+        guard let uk = layouts.ukrainian, let en = layouts.english else { return false }
+        let enText = enChars.joined()
+        var why = ""
+        guard let current = ukrainianReading(of: enText, allowEnglish: streak, why: &why) else { return skip(why) }
 
-        for _ in buffer { post(UInt16(kVK_Delete), nil, shift: false, proxy) }
-        var newKeys: [Key] = []
+        // The word before, if it was left in Latin only because it is also English (yak spravy).
+        var previous: (output: String, keys: [Key], latin: String)?
+        if !streak, let prev = history.last, !prev.keys.isEmpty {
+            let prevLatin = prev.keys.map { en.char(for: $0) ?? "\u{0}" }.joined()
+            var ignored = ""
+            if let p = ukrainianReading(of: prevLatin, allowEnglish: true, why: &ignored),
+               FocusedField.check(expect: prevLatin + " " + enText) == .verified {
+                let keys = zip(prev.keys, prevLatin.map(String.init))
+                    .map { Key(code: $0.code, shift: $0.shift, caps: $0.caps, char: $1) }
+                previous = (p.output, keys, p.word)
+            }
+        }
+        if previous == nil {
+            // The field must really show the Latin word (typed in the English layout).
+            let field = FocusedField.check(expect: enText)
+            DebugLog.write("  translit '\(enText)' → '\(current.output)' · field: \(field) \(FocusedField.detail)")
+            guard field == .verified else { return skip("field check: \(field) in \(appID)") }
+        }
+        let output = (previous.map { $0.output + " " } ?? "") + current.output
+        DebugLog.write("translit: '\(previous.map { $0.latin + " " } ?? "")\(enText)' → '\(output)' in \(appID)")
+
+        let deleteCount = buffer.count + (previous.map { $0.keys.count + 1 } ?? 0)
+        for _ in 0 ..< deleteCount { post(UInt16(kVK_Delete), nil, shift: false, proxy) }
+        var wordKeys: [[Key]] = [[]]
+        var allMapped = true
         for ch in output.map(String.init) {
+            if ch == " " { post(UInt16(kVK_Space), " ", shift: false, proxy); wordKeys.append([]); continue }
             if let k = uk.keyFor[ch] {
                 post(k.code, ch, shift: k.shift, proxy)
-                newKeys.append(Key(code: k.code, shift: k.shift, caps: false, char: ch))
+                wordKeys[wordKeys.count - 1].append(Key(code: k.code, shift: k.shift, caps: false, char: ch))
             } else {
                 post(0, ch, shift: false, proxy)
+                allMapped = false
             }
         }
         post(UInt16(kVK_Space), " ", shift: false, proxy)
 
-        let typedKeys = zip(buffer, enChars).map { Key(code: $0.code, shift: $0.shift, caps: $0.caps, char: $1) }
-        last = Correction(typed: typedKeys, inserted: output, from: en.source, word: word, time: Date())
-        // Backspacing into the result only works if every character came from a real key.
-        if newKeys.count == output.count { pushWord(newKeys) } else { history.removeAll() }
+        var typedKeys = zip(buffer, enChars).map { Key(code: $0.code, shift: $0.shift, caps: $0.caps, char: $1) }
+        var words = [current.word]
+        if let p = previous {
+            typedKeys = p.keys + [Key(code: UInt16(kVK_Space), shift: false, caps: false, char: " ")] + typedKeys
+            words.insert(p.latin, at: 0)
+        }
+        last = Correction(typed: typedKeys, inserted: output, from: en.source, words: words, time: Date())
+
+        // Keep backspacing into the result working (only if every character came from a real key).
+        if previous != nil, let prev = history.popLast() {
+            if allMapped { history.append((wordKeys[0], prev.atStart)) } else { history.removeAll() }
+        }
+        if allMapped, let lastWord = wordKeys.last { pushWord(lastWord) } else { history.removeAll() }
+        translitStreak = true
         buffer.removeAll()
         atWordStart = true
         return true
     }
 
     /// Reverts the last correction. Returns false (and lets the key through) if the text no longer matches.
-    private func undo(_ c: Correction, _ proxy: CGEventTapProxy) -> Bool {
+    private func undo(_ c: Correction, _ proxy: CGEventTapProxy, learn: Bool) -> Bool {
         switch FocusedField.check(expect: c.inserted + " ") {
         case .mismatch, .secure, .notText: return false
         default: break
@@ -886,9 +934,17 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         post(UInt16(kVK_Space), " ", shift: false, proxy)
         selectLayout(c.from)
 
-        if let top = history.popLast() { history.append((c.typed, top.atStart)) }   // the original is back
-        sessionIgnore.insert(c.word.lowercased())
-        if settings.learnOnUndo { addException(c.word) }
+        if c.typed.contains(where: { $0.code == UInt16(kVK_Space) }) {
+            history.removeAll()                                    // two words came back: start fresh
+        } else if let top = history.popLast() {
+            history.append((c.typed, top.atStart))                 // the original is back
+        }
+        for w in c.words {
+            sessionIgnore.insert(w.lowercased())
+            // Backspace is also plain editing, so only an Esc undo is remembered for good.
+            if learn && settings.learnOnUndo { addException(w) }
+        }
+        translitStreak = false
         buffer.removeAll()
         atWordStart = true
         return true
@@ -1087,9 +1143,10 @@ struct SettingsView: View {
                 Toggle("Only in text fields", isOn: $model.config.requireTextField)
                 Picker("Undo a fix with", selection: $model.config.undoKey) {
                     Text("Esc").tag("escape")
+                    Text("Backspace").tag("backspace")
                     Text("Off").tag("none")
                 }
-                Toggle("Never convert undone words again", isOn: $model.config.learnOnUndo)
+                Toggle("Never convert words undone with Esc", isOn: $model.config.learnOnUndo)
                 Toggle("Ukrainian typed in Latin → Cyrillic (privit → привіт)", isOn: $model.config.transliteration)
             }
             Section {
