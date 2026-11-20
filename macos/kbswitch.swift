@@ -381,6 +381,15 @@ enum Decision {
         }
     }
 
+    /// Letters of one alphabet (inner apostrophe/hyphen allowed) in natural casing: word, Word, WORD.
+    static func isCleanWord(_ w: String, _ lang: String) -> Bool {
+        guard let first = w.first, let last = w.last, isLetter(first, lang), isLetter(last, lang),
+              w.allSatisfy({ isLetter($0, lang) || innerMarks.contains($0) }) else { return false }
+        let letters = w.filter { $0.isLetter }
+        let capitalized = letters.prefix(1).uppercased() + letters.dropFirst().lowercased()
+        return letters == letters.lowercased() || letters == letters.uppercased() || letters == capitalized
+    }
+
     /// nil = convert; otherwise the reason not to (used for the diagnostic log).
     static func rejection(typed: String, converted: String, fromLang: String, toLang: String,
                           minLength: Int, exceptions: Set<String>,
@@ -534,7 +543,7 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var atWordStart = false     // a word boundary was seen right before `buffer`
     /// Words (and empty gaps) before each Space typed since the last reset, so that backspacing
     /// over a Space brings the previous word back and editing it still works.
-    private var history: [(keys: [Key], atStart: Bool)] = []
+    private var history: [(keys: [Key], atStart: Bool, changed: Bool)] = []
     private var last: Correction?
 
     private var active: Bool { settings.enabled }
@@ -679,8 +688,9 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return "'\(e)|\(u)'"
     }
 
-    private func pushWord(_ keys: [Key]) {
-        history.append((keys, atWordStart))
+    /// `changed`: KBSwitch converted this word (or the user undid a conversion): leave it alone later.
+    private func pushWord(_ keys: [Key], changed: Bool = false) {
+        history.append((keys, atWordStart, changed))
         if history.count > 10 { history.removeFirst() }
     }
 
@@ -841,18 +851,61 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let typed = fromChars.joined(), converted = newChars.joined()
         // From here on the keys carry the characters that are really on screen.
         buffer = zip(buffer, fromChars).map { Key(code: $0.code, shift: $0.shift, caps: $0.caps, char: $1) }
-        DebugLog.write("fix: '\(typed)' → '\(converted)' in \(appID)")
 
-        for _ in buffer { post(UInt16(kVK_Delete), nil, shift: false, proxy) }
+        // Words just before this one, typed in the same wrong layout but left alone because they
+        // were also fine as they were (s → і, d → в, ne → те): now that the context is clear,
+        // convert them too. Only words KBSwitch didn't change, up to 3, and only if the field
+        // shows exactly "those words + this word".
+        var previous: [(from: [Key], to: [Key], fromText: String, toText: String)] = []
+        if field == .verified {
+            let exceptions = settings.exceptions.union(sessionIgnore)
+            for entry in history.reversed() {
+                guard previous.count < 3, !entry.changed, !entry.keys.isEmpty else { break }
+                let f = entry.keys.compactMap { pair.from.char(for: $0) }
+                let t = entry.keys.compactMap { pair.to.char(for: $0) }
+                guard f.count == entry.keys.count, t.count == entry.keys.count else { break }
+                let fromText = f.joined(), toText = t.joined()
+                guard fromText != toText, Decision.isCleanWord(toText, pair.to.lang),
+                      lexicon.isWord(toText, pair.to.lang),
+                      !exceptions.contains(fromText.lowercased()), !exceptions.contains(toText.lowercased())
+                else { break }
+                previous.insert((zip(entry.keys, f).map { Key(code: $0.code, shift: $0.shift, caps: $0.caps, char: $1) },
+                                 zip(entry.keys, t).map { Key(code: $0.code, shift: $0.shift, caps: $0.caps, char: $1) },
+                                 fromText, toText), at: 0)
+            }
+            // Confirm on screen; if the full run doesn't match, try with fewer words.
+            while !previous.isEmpty {
+                let expect = (previous.map { $0.fromText } + [typed]).joined(separator: " ")
+                if FocusedField.check(expect: expect) == .verified { break }
+                previous.removeFirst()
+            }
+        }
+        let before = previous.map { $0.fromText + " " }.joined()
+        let beforeNew = previous.map { $0.toText + " " }.joined()
+        DebugLog.write("fix: '\(before)\(typed)' → '\(beforeNew)\(converted)' in \(appID)")
+
+        let deleteCount = buffer.count + previous.reduce(0) { $0 + $1.from.count + 1 }
+        for _ in 0 ..< deleteCount { post(UInt16(kVK_Delete), nil, shift: false, proxy) }
+        for p in previous {
+            for k in p.to { post(k.code, k.char, shift: k.shift, proxy) }
+            post(UInt16(kVK_Space), " ", shift: false, proxy)
+        }
         for (key, c) in zip(buffer, newChars) { post(key.code, c, shift: key.shift, proxy) }
         post(UInt16(kVK_Space), " ", shift: false, proxy)
         selectLayout(pair.to.source)
 
-        last = Correction(typed: buffer, inserted: converted, from: pair.from.source,
-                          words: [Decision.core(typed)], time: Date())
+        let space = Key(code: UInt16(kVK_Space), shift: false, caps: false, char: " ")
+        last = Correction(typed: previous.flatMap { $0.from + [space] } + buffer,
+                          inserted: beforeNew + converted, from: pair.from.source,
+                          words: previous.map { $0.fromText } + [Decision.core(typed)], time: Date())
         translitStreak = false
-        // Remember the word as it now appears, so backspacing into it keeps working.
-        pushWord(zip(buffer, newChars).map { Key(code: $0.code, shift: $0.shift, caps: $0.caps, char: $1) })
+        // Remember the words as they now appear, so backspacing into them keeps working.
+        if !previous.isEmpty {
+            let starts = history.suffix(previous.count).map { $0.atStart }
+            history.removeLast(previous.count)
+            for (p, start) in zip(previous, starts) { history.append((p.to, start, true)) }
+        }
+        pushWord(zip(buffer, newChars).map { Key(code: $0.code, shift: $0.shift, caps: $0.caps, char: $1) }, changed: true)
         buffer.removeAll()
         atWordStart = true
         return true
@@ -944,9 +997,9 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         // Keep backspacing into the result working (only if every character came from a real key).
         if previous != nil, let prev = history.popLast() {
-            if allMapped { history.append((wordKeys[0], prev.atStart)) } else { history.removeAll() }
+            if allMapped { history.append((wordKeys[0], prev.atStart, true)) } else { history.removeAll() }
         }
-        if allMapped, let lastWord = wordKeys.last { pushWord(lastWord) } else { history.removeAll() }
+        if allMapped, let lastWord = wordKeys.last { pushWord(lastWord, changed: true) } else { history.removeAll() }
         translitStreak = true
         buffer.removeAll()
         atWordStart = true
@@ -967,7 +1020,7 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if c.typed.contains(where: { $0.code == UInt16(kVK_Space) }) {
             history.removeAll()                                    // two words came back: start fresh
         } else if let top = history.popLast() {
-            history.append((c.typed, top.atStart))                 // the original is back
+            history.append((c.typed, top.atStart, true))           // the original is back (user's choice)
         }
         for w in c.words {
             sessionIgnore.insert(w.lowercased())
