@@ -20,13 +20,13 @@ command -v swiftc >/dev/null || { echo "✗ swiftc not found. Run:  xcode-select
 CACHE="$HOME/Library/Caches/KBSwitch"
 mkdir -p "$CACHE"
 
-# Hunspell (in ./hunspell) checks Ukrainian words; compiled once and cached.
+# Hunspell (../hunspell, shared with the Windows version) checks Ukrainian words; compiled once and cached.
 HSOBJ="$CACHE/hunspell-1.7.2-$(uname -m)"
 if [ ! -f "$HSOBJ/.done" ]; then
   echo "→ Compiling Hunspell (one time)"
   rm -rf "$HSOBJ" && mkdir -p "$HSOBJ"
-  for f in hunspell/*.cxx; do
-    clang++ -c -O2 -std=c++11 -DHUNSPELL_STATIC -w -Ihunspell "$f" -o "$HSOBJ/$(basename "$f" .cxx).o"
+  for f in ../hunspell/*.cxx; do
+    clang++ -c -O2 -std=c++11 -DHUNSPELL_STATIC -w -I../hunspell "$f" -o "$HSOBJ/$(basename "$f" .cxx).o"
   done
   touch "$HSOBJ/.done"
 fi
@@ -48,7 +48,7 @@ fi
 
 echo "→ Compiling"
 rm -rf build && mkdir -p "$OUT/Contents/MacOS" "$OUT/Contents/Resources"
-swiftc -O -swift-version 5 -import-objc-header hunspell/bridge.h -Xcc -DHUNSPELL_STATIC -Xcc -Ihunspell \
+swiftc -O -swift-version 5 -import-objc-header ../hunspell/bridge.h -Xcc -DHUNSPELL_STATIC -Xcc -I../hunspell \
   kbswitch.swift "$HSOBJ"/*.o -lc++ -o "$OUT/Contents/MacOS/kbswitch"
 cp "$CACHE/uk_UA.aff" "$CACHE/uk_UA.dic" "$OUT/Contents/Resources/"
 cp Resources/MenuBarIcon.png Resources/MenuBarIcon@2x.png "$OUT/Contents/Resources/"
@@ -83,8 +83,8 @@ EOF
 
 if $CI; then
   codesign --force --sign - "$OUT"
-  (cd build && ditto -c -k --keepParent KBSwitch.app KBSwitch.zip)
-  echo "✓ Built build/KBSwitch.app and build/KBSwitch.zip"
+  (cd build && ditto -c -k --keepParent KBSwitch.app KBSwitch-macOS.zip)
+  echo "✓ Built build/KBSwitch.app and build/KBSwitch-macOS.zip"
   exit 0
 fi
 

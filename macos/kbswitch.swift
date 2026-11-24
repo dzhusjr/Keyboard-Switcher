@@ -952,7 +952,7 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         // The word before, if it was left in Latin only because it is also English (yak spravy).
         var previous: (output: String, keys: [Key], latin: String)?
-        if !streak, let prev = history.last, !prev.keys.isEmpty {
+        if !streak, let prev = history.last, !prev.keys.isEmpty, !prev.changed {
             let prevLatin = prev.keys.map { en.char(for: $0) ?? "\u{0}" }.joined()
             var ignored = ""
             if let p = ukrainianReading(of: prevLatin, allowEnglish: true, why: &ignored),

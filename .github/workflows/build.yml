@@ -1,0 +1,52 @@
+# Builds KBSwitch for macOS and Windows on every push.
+# Pushing a tag like v2.1 also publishes a GitHub Release with KBSwitch-macOS.zip and
+# KBSwitch-Windows.zip, which anyone can download (no GitHub account needed).
+name: Build
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: cd macos && ./build.sh --ci
+      - uses: actions/upload-artifact@v4
+        with:
+          name: KBSwitch-macOS
+          path: macos/build/KBSwitch-macOS.zip
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        shell: pwsh
+        run: ./windows/build.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: KBSwitch-Windows
+          path: windows/dist/KBSwitch-Windows.zip
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [macos, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/KBSwitch-macOS.zip
+            dist/KBSwitch-Windows.zip

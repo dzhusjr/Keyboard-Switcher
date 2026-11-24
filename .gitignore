@@ -1,3 +1,5 @@
 Claude outputs/
 macos/build/
+windows/build/
+windows/dist/
 .DS_Store
