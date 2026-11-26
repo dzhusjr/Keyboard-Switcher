@@ -3,6 +3,9 @@
 #include "kbcorrect.h"
 
 #include <algorithm>
+#ifndef KB_E1
+#define KB_E1 5
+#endif
 #ifndef KB_E3
 #define KB_E3 99
 #endif
@@ -394,7 +397,16 @@ u32 orthographyKey(u32 w) {
     return w;
 }
 
-int maxEditsFor(size_t len) { return len <= 5 ? 1 : len <= KB_E2 ? 2 : len <= KB_E3 ? 3 : 4; }
+bool isSubsequence(const u32& a, const u32& b) {
+    size_t i = 0;
+    for (char32_t c : b) if (i < a.size() && a[i] == c) i++;
+    return i == a.size();
+}
+
+#ifndef KB_SKIP_MIN
+#define KB_SKIP_MIN 4
+#endif
+int maxEditsFor(size_t len) { return len <= KB_E1 ? 1 : len <= KB_E2 ? 2 : len <= KB_E3 ? 3 : 4; }
 #ifndef KB_E2
 #endif
 
@@ -490,7 +502,9 @@ int kb_correct(KBModel* m, const char* typedUtf8, const char* prevUtf8, const ch
     double keep = score(typedId, typed) + kKeepBonus - (common ? 0 : kNotInDictionary);
 
     std::vector<Candidate> cands;
-    search(m, typed, realWord ? 1 : maxEditsFor(typed.size()), cands);
+    // Short words: one slip, or two letters left out (звзок -> зв'язок).
+    bool shortWord = (int)maxEditsFor(typed.size()) == 1 && typed.size() >= KB_SKIP_MIN;
+    search(m, typed, realWord ? 1 : shortWord ? 2 : maxEditsFor(typed.size()), cands);
     for (const u32& l : m->learned)
         if (distance(typed, l) <= maxEditsFor(typed.size())) cands.push_back({-1, l});
 
@@ -504,6 +518,8 @@ int kb_correct(KBModel* m, const char* typedUtf8, const char* prevUtf8, const ch
             std::sort(a.begin(), a.end()); std::sort(b.begin(), b.end());
             if (a != b || distance(typed, c.text) != 1) continue;
         }
+        if (shortWord && c.text.size() != typed.size() + 2 && distance(typed, c.text) > 1) continue;
+        if (shortWord && c.text.size() == typed.size() + 2 && !isSubsequence(typed, c.text)) continue;
         if (realWord && (c.id < 0 || m->uni[c.id] < kCommonRealWord || distance(typed, c.text) != 1)) continue;
         if (++looked > m->budget) return 0;
         double s = score(c.id, c.text) - typingCost(m, typed, c.text);
