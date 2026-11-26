@@ -559,13 +559,14 @@ struct Smart {
         for (const wstring& w : words) { kb_learn(en, utf8(w).c_str()); kb_learn(uk, utf8(w).c_str()); }
     }
 
+    /// `valid`: the word is in the dictionary (then only a rare word one slip from a very common one changes).
     std::optional<wstring> correct(const wstring& word, const wstring& lang,
-                                   const std::optional<wstring>& prev, const std::optional<wstring>& next) {
+                                   const std::optional<wstring>& prev, const std::optional<wstring>& next, bool valid = false) {
         KBModel* m = lang == L"en" ? en : uk;
         if (!ready() || !m) return std::nullopt;
         std::string p = prev ? utf8(*prev) : std::string(), n = next ? utf8(*next) : std::string();
         char out[256];
-        if (kb_correct(m, utf8(word).c_str(), prev ? p.c_str() : nullptr, next ? n.c_str() : nullptr, 0, out, sizeof out, nullptr))
+        if (kb_correct(m, utf8(word).c_str(), prev ? p.c_str() : nullptr, next ? n.c_str() : nullptr, valid ? 1 : 0, out, sizeof out, nullptr))
             return wide(out);
         return std::nullopt;
     }
@@ -1061,9 +1062,16 @@ private:
         wstring why;
         bool translit = config.transliteration && ukrainianReading(j.enText, streak, why).has_value();
         bool smart = config.typoFixing == L"smart" && g_smart.ready();
+        bool enWord = g_lexicon.isWord(j.enText, L"en"), ukWord = g_lexicon.isWord(j.ukText, L"uk");
         bool typo = ((config.typoFixing == L"careful" && buffer_.size() >= 4) || (smart && buffer_.size() >= 3)) &&
-                    (Typos::isPlain(j.enText, L"en") || Typos::isPlain(j.ukText, L"uk")) &&
-                    !g_lexicon.isWord(j.enText, L"en") && !g_lexicon.isWord(j.ukText, L"uk");
+                    (Typos::isPlain(j.enText, L"en") || Typos::isPlain(j.ukText, L"uk")) && !enWord && !ukWord;
+        // Smart: a rare dictionary word one slip from a very common one (kike -> like). The engine
+        // answers this in microseconds, so it's asked here, before reading the field.
+        if (smart && !typo && buffer_.size() >= 3 && enWord != ukWord) {
+            const wstring& w = enWord ? j.enText : j.ukText;
+            const wchar_t* lang = enWord ? L"en" : L"uk";
+            typo = Typos::isPlain(w, lang) && g_smart.correct(w, lang, earlierWord(1, enWord), std::nullopt, true).has_value();
+        }
         if (!layoutFix && !translit && !typo && !(smart && previousWorthChecking())) {
             if (g_logOn) logLine(L"skip: en '" + j.enText + L"' / uk '" + j.ukText + L"': nothing to fix (en->uk: " +
                                  j.enToUk.value_or(L"") + L"; uk->en: " + j.ukToEn.value_or(L"") + L")");
@@ -1369,11 +1377,13 @@ private:
         HKL screenHkl = inEnglish ? g_layouts.en : g_layouts.uk, otherHkl = inEnglish ? g_layouts.uk : g_layouts.en;
         std::set<wstring> exc = exceptions();
         if (exc.count(lower(screen)) || exc.count(lower(other))) return false;
-        if (g_lexicon.isWord(screen, screenLang) || g_lexicon.isWord(other, otherLang)) return false;
+        bool screenWord = g_lexicon.isWord(screen, screenLang), otherWord = g_lexicon.isWord(other, otherLang);
+        if (otherWord) return false;
         std::optional<wstring> fix;
         bool otherLayout = false;
-        if (Typos::isPlain(screen, screenLang)) fix = g_smart.correct(screen, screenLang, earlierWord(1, inEnglish), std::nullopt);
-        if (!fix && Typos::isPlain(other, otherLang)) {
+        // A dictionary word only changes if it's a rare word one slip from a very common one (kike -> like).
+        if (Typos::isPlain(screen, screenLang)) fix = g_smart.correct(screen, screenLang, earlierWord(1, inEnglish), std::nullopt, screenWord);
+        if (!fix && !screenWord && Typos::isPlain(other, otherLang)) {
             fix = g_smart.correct(other, otherLang, earlierWord(1, !inEnglish), std::nullopt);
             otherLayout = fix.has_value();
         }

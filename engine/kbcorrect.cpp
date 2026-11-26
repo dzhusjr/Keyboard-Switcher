@@ -45,6 +45,18 @@ const double kExtraEditMargin = KB_EXTRA;  // ... plus this much for every edit 
 const double kAmbiguity     = 1.6;    // ... and only if the runner-up is this far behind
 const double kCommonWord    = std::log(std::pow(10.0, 3.0 - 9));   // Zipf 3: common enough to suggest
                                                                     // without being in the dictionary (slang)
+#ifndef KB_RW_RARE
+#define KB_RW_RARE 2.5
+#endif
+#ifndef KB_RW_COMMON
+#define KB_RW_COMMON 4.0
+#endif
+#ifndef KB_RW_MARGIN
+#define KB_RW_MARGIN 4.0
+#endif
+const double kRareRealWord = std::log(std::pow(10.0, KB_RW_RARE - 9));     // a dictionary word rarer than this...
+const double kCommonRealWord = std::log(std::pow(10.0, KB_RW_COMMON - 9)); // ...may become a word this common
+const double kRealWordMargin = KB_RW_MARGIN;                               // ...if it wins by this much
 #ifndef KB_AMB_FAR
 #define KB_AMB_FAR 0.5
 #endif
@@ -435,9 +447,11 @@ int kb_correct(KBModel* m, const char* typedUtf8, const char* prevUtf8, const ch
     if (typed.size() < 3 || isLearned(m, typed)) return 0;
 
     int typedId = findWord(m, typed);
-    // A dictionary word is never changed: even with context, "fixing" real words (form -> from)
-    // turned out to change more correct text than it fixed.
-    if (typedValid || (typedId >= 0 && trusted(m, typedId))) return 0;
+    // A dictionary word is normally never changed: "fixing" real words (form -> from) changes more
+    // correct text than it fixes. The exception is a rare word (лата, kike) one slip away from a
+    // very common one (дата, like): the common word is almost always what was meant.
+    bool realWord = typedValid || (typedId >= 0 && trusted(m, typedId));
+    if (realWord && typedId >= 0 && m->uni[typedId] >= kRareRealWord) return 0;
     int prev = -1;
     if (prevUtf8) prev = prevUtf8[0] ? findWord(m, decode(prevUtf8)) : (int)m->startId;
     u32 next = decode(nextUtf8);
@@ -450,11 +464,11 @@ int kb_correct(KBModel* m, const char* typedUtf8, const char* prevUtf8, const ch
     };
     // Leaving the word as typed: frequent non-dictionary words (slang: thx, лол, норм) keep their
     // weight; rare ones are often misspellings.
-    bool common = typedId >= 0 && m->uni[typedId] >= kCommonWord;
+    bool common = realWord || (typedId >= 0 && m->uni[typedId] >= kCommonWord);
     double keep = score(typedId, typed) + kKeepBonus - (common ? 0 : kNotInDictionary);
 
     std::vector<Candidate> cands;
-    search(m, typed, maxEditsFor(typed.size()), cands);
+    search(m, typed, realWord ? 1 : maxEditsFor(typed.size()), cands);
     for (const u32& l : m->learned)
         if (distance(typed, l) <= maxEditsFor(typed.size())) cands.push_back({-1, l});
 
@@ -468,6 +482,7 @@ int kb_correct(KBModel* m, const char* typedUtf8, const char* prevUtf8, const ch
             std::sort(a.begin(), a.end()); std::sort(b.begin(), b.end());
             if (a != b || distance(typed, c.text) != 1) continue;
         }
+        if (realWord && (c.id < 0 || m->uni[c.id] < kCommonRealWord || distance(typed, c.text) != 1)) continue;
         if (++looked > m->budget) return 0;
         double s = score(c.id, c.text) - typingCost(m, typed, c.text);
         if (s > best) { second = best; runnerUp = winner; best = s; winner = c.text; }
@@ -477,7 +492,7 @@ int kb_correct(KBModel* m, const char* typedUtf8, const char* prevUtf8, const ch
     if (m->ukrainian && orthographyKey(winner) == orthographyKey(typed)) return 0;
     double lead = best - keep;
     if (margin) *margin = lead;
-    double needed = kNonWordMargin + kExtraEditMargin * (distance(typed, winner) - 1) + (typedId < 0 ? 0 : m->uni[typedId] >= kRareWord ? kSeenWordMargin : kSeenWordMargin / 2);
+    double needed = realWord ? kRealWordMargin : kNonWordMargin + kExtraEditMargin * (distance(typed, winner) - 1) + (typedId < 0 ? 0 : m->uni[typedId] >= kRareWord ? kSeenWordMargin : kSeenWordMargin / 2);
     if (lead < needed) return 0;
     // Too close to call - unless the runner-up needs more edits than the winner (mistakess: mistakes
     // vs mistake), where the nearer word is the safer reading.

@@ -407,12 +407,13 @@ final class SmartCorrector {
         for w in words { kb_learn(en, w); kb_learn(uk, w) }
     }
 
-    func correct(_ word: String, lang: String, prev: String?, next: String?) -> String? {
+    /// `valid`: the word is in the dictionary (then only a rare word one slip from a very common one changes).
+    func correct(_ word: String, lang: String, prev: String?, next: String?, valid: Bool = false) -> String? {
         guard let m = lang == "en" ? en : uk else { return nil }
         var out = [CChar](repeating: 0, count: 256)
         let size = Int32(out.count)
         let ok = withOptionalCString(prev) { p in
-            withOptionalCString(next) { n in kb_correct(m, word, p, n, 0, &out, size, nil) }
+            withOptionalCString(next) { n in kb_correct(m, word, p, n, valid ? 1 : 0, &out, size, nil) }
         }
         return ok == 1 ? String(cString: out) : nil
     }
@@ -984,6 +985,8 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if let why = typedInEnglish ? enToUk : ukToEn {
                 // A Latin word that is fine as English may still be transliterated (in context).
                 if typedInEnglish, settings.transliteration, transliterate(enChars, appID, streak: streak, proxy) { return true }
+                // A rare word one slip from a very common one (kike → like).
+                if settings.typoFixing == "smart", smartFix(enChars, ukChars, appID, proxy) { return true }
                 return skip("'\(typedInEnglish ? enText : ukText)' is on screen and is fine: \(why)")
             }
         case .unverified, .unknown, .notText:
@@ -1234,21 +1237,33 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard enPlain || ukPlain else { return skip("'\(enText)' / '\(ukText)' is not a plain lowercase word") }
         let exceptions = settings.exceptions.union(sessionIgnore)
         guard !exceptions.contains(enText), !exceptions.contains(ukText) else { return skip("in exceptions") }
-        guard !lexicon.isWord(enText, "en"), !lexicon.isWord(ukText, "uk") else { return false }
+        let enWord = lexicon.isWord(enText, "en"), ukWord = lexicon.isWord(ukText, "uk")
+        guard !(enWord && ukWord) else { return false }
+        let enSide: Side = (enText, "en", en, enPlain, enChars), ukSide: Side = (ukText, "uk", uk, ukPlain, ukChars)
+
+        // Ask the engine first: it's fast and needs no access to the text field. A dictionary word
+        // only changes if it's a rare word one slip from a very common one (kike → like).
+        func attempt(_ side: Side, valid: Bool) -> String? {
+            guard side.plain else { return nil }
+            return smart.correct(side.text, lang: side.lang, prev: earlierWord(1, in: side.layout, side.lang), next: nil, valid: valid)
+        }
+        let enFix = attempt(enSide, valid: enWord), ukFix = attempt(ukSide, valid: ukWord)
+        guard enFix != nil || ukFix != nil else {
+            return enWord || ukWord ? false : skip("no confident correction for '\(enText)' / '\(ukText)'")
+        }
 
         let field = FocusedField.check(candidates: [enText, ukText])
         guard field == .verified else { return skip("field check: \(field) in \(appID)") }
         let onScreenEnglish = FocusedField.matched == 0
-        let enSide: Side = (enText, "en", en, enPlain, enChars), ukSide: Side = (ukText, "uk", uk, ukPlain, ukChars)
         let screen = onScreenEnglish ? enSide : ukSide, other = onScreenEnglish ? ukSide : enSide
+        let screenWord = onScreenEnglish ? enWord : ukWord, otherWord = onScreenEnglish ? ukWord : enWord
 
-        func attempt(_ side: Side) -> String? {
-            guard side.plain else { return nil }
-            return smart.correct(side.text, lang: side.lang, prev: earlierWord(1, in: side.layout, side.lang), next: nil)
-        }
         var target = screen
-        var fix = attempt(screen)
-        if fix == nil, let f = attempt(other) { fix = f; target = other }    // wrong layout and a typo
+        var fix = onScreenEnglish ? enFix : ukFix
+        if fix == nil, !screenWord, !otherWord {                  // wrong layout and a typo
+            fix = onScreenEnglish ? ukFix : enFix
+            target = other
+        }
         guard let fixed = fix else { return skip("no confident correction for '\(screen.text)'") }
         guard !exceptions.contains(fixed) else { return skip("'\(fixed)' is in exceptions") }
         DebugLog.write("smart: '\(screen.text)' → '\(fixed)' in \(appID)")
