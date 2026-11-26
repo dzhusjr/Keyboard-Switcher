@@ -46,6 +46,14 @@ void kb_set_budget(KBModel* m, int candidates);
 int kb_correct(KBModel* m, const char* typed, const char* prev, const char* next, int typed_valid,
                char* out, int out_size, double* margin);
 
+/**
+ * How plausible `typed` is as something meant in this language: the log-probability of the word
+ * itself (given prev) if it's a word, or of its best correction minus the cost of the typing slip.
+ * Used to choose between "typed in the wrong layout" and "a typo in this language". Very negative
+ * (about -1e9) if there's no reading at all.
+ */
+double kb_reading(KBModel* m, const char* typed, const char* prev);
+
 #ifdef __cplusplus
 }
 #endif

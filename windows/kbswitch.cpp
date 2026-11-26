@@ -559,6 +559,14 @@ struct Smart {
         for (const wstring& w : words) { kb_learn(en, utf8(w).c_str()); kb_learn(uk, utf8(w).c_str()); }
     }
 
+    /// How plausible `word` is as meant in `lang` (itself, or its best correction minus the slip).
+    double reading(const wstring& word, const wstring& lang, const std::optional<wstring>& prev) {
+        KBModel* m = lang == L"en" ? en : uk;
+        if (!ready() || !m) return -1e9;
+        std::string p = prev ? utf8(*prev) : std::string();
+        return kb_reading(m, utf8(word).c_str(), prev ? p.c_str() : nullptr);
+    }
+
     /// `valid`: the word is in the dictionary (then only a rare word one slip from a very common one changes).
     std::optional<wstring> correct(const wstring& word, const wstring& lang,
                                    const std::optional<wstring>& prev, const std::optional<wstring>& next, bool valid = false) {
@@ -842,7 +850,7 @@ public:
         switch (vk) {
             case VK_SPACE:
                 if (repeat) { reset(L"held Space"); atWordStart_ = true; return false; }
-                if (!buffer_.empty() && startWordCheck()) return true;
+                if (!buffer_.empty() && startWordCheck(VK_SPACE)) return true;
                 pushWord(buffer_, false);
                 buffer_.clear();
                 atWordStart_ = true;
@@ -857,6 +865,8 @@ public:
                 } else atWordStart_ = false;
                 break;
             case VK_RETURN:
+                // Check the last word first, like Space does: the fix goes in before the Return.
+                if (!repeat && !buffer_.empty() && startWordCheck(VK_RETURN)) return true;
                 // A new line starts, or a message was sent: earlier words can't be returned to safely.
                 buffer_.clear(); history_.clear(); atWordStart_ = true;
                 break;
@@ -1037,14 +1047,15 @@ private:
         return std::make_pair(out + trail, word);
     }
 
-    bool startWordCheck() {
+    bool startWordCheck(WORD endKey) {
         bool streak = translitStreak_;
         translitStreak_ = false;
         int shortest = config.transliteration ? 1 : config.minLength;
         if ((int)buffer_.size() > config.maxLength) return false;
         bool tooShort = (int)buffer_.size() < shortest;
+        bool amp = endsWithAmpersand();
         // A short word can still give the word before it the context it needs (Smart mode).
-        if (tooShort && !(config.typoFixing == L"smart" && g_smart.ready() && previousWorthChecking())) return false;
+        if (tooShort && !amp && !(config.typoFixing == L"smart" && g_smart.ready() && previousWorthChecking())) return false;
         if (!g_layouts.en || !g_layouts.uk) { logLine(L"skip: need both an English and a Ukrainian layout"); return false; }
         if (!g_lexicon.en.ok() || !g_lexicon.uk.ok()) { logLine(L"skip: dictionaries missing next to the exe (dict\\)"); return false; }
 
@@ -1072,7 +1083,7 @@ private:
             const wchar_t* lang = enWord ? L"en" : L"uk";
             typo = Typos::isPlain(w, lang) && g_smart.correct(w, lang, earlierWord(1, enWord), std::nullopt, true).has_value();
         }
-        if (!layoutFix && !translit && !typo && !(smart && previousWorthChecking())) {
+        if (!layoutFix && !translit && !typo && !amp && !(smart && previousWorthChecking())) {
             if (g_logOn) logLine(L"skip: en '" + j.enText + L"' / uk '" + j.ukText + L"': nothing to fix (en->uk: " +
                                  j.enToUk.value_or(L"") + L"; uk->en: " + j.ukToEn.value_or(L"") + L")");
             return false;
@@ -1083,7 +1094,7 @@ private:
         if (fg.elevated) { logLine(L"skip: " + fg.exe + L" runs as administrator"); return false; }
 
         j.kind = Job::Word;
-        j.heldKey = VK_SPACE;
+        j.heldKey = endKey;
         j.tooShort = tooShort;
         begin(j, {j.enText, j.ukText});
         return true;
@@ -1149,7 +1160,13 @@ private:
         if (!in.empty()) SendInput((UINT)in.size(), in.data(), sizeof(INPUT));
     }
 
-    void finishJob() { busy_ = false; }
+    void finishJob() {
+        busy_ = false;
+        // Return: a new line starts, or a message was sent; earlier words can't be returned to safely.
+        if (job_.kind == Job::Word && job_.heldKey == VK_RETURN) {
+            buffer_.clear(); history_.clear(); atWordStart_ = true; last_.reset();
+        }
+    }
 
     static void switchLayout(HKL hkl) {
         HWND target = GetForegroundWindow();
@@ -1163,7 +1180,7 @@ private:
         pushWord(job_.keys, false);
         buffer_.clear();
         atWordStart_ = true;
-        send({}, VK_SPACE);
+        send({}, job_.heldKey);
         finishJob();
     }
 
@@ -1172,7 +1189,7 @@ private:
         bool inEnglish = fieldShows(f, job_.enText), inUkrainian = fieldShows(f, job_.ukText);
         if (!inEnglish && !inUkrainian) { logLine(L"skip: the field doesn't show the typed word"); skipWord(); return; }
         if (config.typoFixing == L"smart") fixPreviousWord(f);
-        if (job_.tooShort) { skipWord(); return; }
+        if (job_.tooShort) { if (!questionMark(f)) skipWord(); return; }
 
         const std::optional<wstring>& why = inEnglish ? job_.enToUk : job_.ukToEn;
         if (why) {
@@ -1182,6 +1199,7 @@ private:
             if (config.typoFixing == L"smart" && smartFix(inEnglish)) return;
             // This word shows which language you're writing in: fix a short word before it (jr? -> ок?).
             convertShortPrevious(f, inEnglish);
+            if (questionMark(f)) return;
             logLine(L"skip: '" + (inEnglish ? job_.enText : job_.ukText) + L"' is on screen and is fine: " + *why);
             skipWord();
             return;
@@ -1193,6 +1211,22 @@ private:
         HKL from = inEnglish ? g_layouts.en : g_layouts.uk, to = inEnglish ? g_layouts.uk : g_layouts.en;
         wstring toLang = inEnglish ? L"uk" : L"en";
         wstring typed = inEnglish ? job_.enText : job_.ukText, converted = inEnglish ? job_.ukText : job_.enText;
+
+        // Smart: you were writing in this language and the word is a typo of a word in it that happens
+        // to spell a word in the other layout (wdsnt -> цвіте, meant wasnt): don't convert.
+        if (config.typoFixing == L"smart" && g_smart.ready()) {
+            wstring fromLang = inEnglish ? L"en" : L"uk";
+            std::optional<wstring> before = earlierWord(1, inEnglish);
+            if (before && g_lexicon.isWord(*before, fromLang)) {
+                double asTypo = g_smart.reading(lower(typed), fromLang, before);
+                double asLayout = g_smart.reading(lower(converted), toLang, std::nullopt);
+                if (asTypo > asLayout - 7.5) {
+                    logLine(L"skip: '" + typed + L"' after '" + *before + L"' looks like a " + fromLang + L" typo, not '" + converted + L"'");
+                    if (!questionMark(f)) skipWord();
+                    return;
+                }
+            }
+        }
 
         // Words just before this one, typed in the same wrong layout but left alone because they were
         // also fine as they were (s -> і, d -> в): convert them too, if KBSwitch didn't change them
@@ -1226,8 +1260,8 @@ private:
 
         vector<INPUT> in;
         for (size_t i = 0; i < oldText.size(); i++) addKey(in, VK_BACK);
-        addText(in, newText + L" ");
-        send(in, 0);
+        addText(in, newText);
+        send(in, job_.heldKey);       // the Space or Return that ended the word
         switchLayout(to);
 
         Correction c;
@@ -1273,8 +1307,8 @@ private:
 
         vector<INPUT> in;
         for (size_t i = 0; i < oldText.size(); i++) addKey(in, VK_BACK);
-        addText(in, newText + L" ");
-        send(in, 0);
+        addText(in, newText);
+        send(in, job_.heldKey);       // the Space or Return that ended the word
 
         Correction c;
         if (previous) { c.typedKeys = prevKeys; c.typedKeys.push_back(Key{VK_SPACE, 0, false, false}); c.words.push_back(previous->second); }
@@ -1329,8 +1363,8 @@ private:
         HKL otherHkl = switchTo;
         vector<INPUT> in;
         for (size_t i = 0; i < screen.size(); i++) addKey(in, VK_BACK);
-        addText(in, *fix + L" ");
-        send(in, 0);
+        addText(in, *fix);
+        send(in, job_.heldKey);
         if (otherLayout) switchLayout(otherHkl);
 
         Correction c;
@@ -1432,6 +1466,37 @@ private:
             last_ = cc;
             return;
         }
+    }
+
+    /// "word&" (& stuck to the end of a word, as typed in English) — Shift+7 is ? in Ukrainian.
+    bool endsWithAmpersand() const {
+        if (buffer_.size() < 2) return false;
+        wstring last = Layouts::charFor(buffer_.back(), g_layouts.en), before = Layouts::charFor(buffer_[buffer_.size() - 2], g_layouts.en);
+        return last == L"&" && !before.empty() && iswalpha(before[0]);
+    }
+
+    /// "word&" + Space/Return -> "word?". "you & me" and "&&" stay.
+    bool questionMark(const FieldRead& f) {
+        if (!config.enabled || job_.keys.size() < 2) return false;
+        wstring w = job_.enText;
+        if (w.size() < 2 || w.back() != L'&' || !iswalpha(w[w.size() - 2]) || !fieldShows(f, w)) return false;
+        logLine(L"'" + w + L"' -> '" + w.substr(0, w.size() - 1) + L"?'");
+        vector<INPUT> in;
+        addKey(in, VK_BACK);
+        addText(in, L"?");
+        Correction c;
+        c.typedKeys = job_.keys;
+        c.typedText = w;
+        c.inserted = w.substr(0, w.size() - 1) + L"?";
+        c.fromLayout = g_layouts.en;
+        c.time = GetTickCount64();
+        last_ = c;
+        pushWord(job_.keys, true);
+        buffer_.clear();
+        atWordStart_ = true;
+        send(in, job_.heldKey);
+        finishJob();
+        return true;
     }
 
     /// A word too short to convert on its own is converted once the next word, typed correctly in

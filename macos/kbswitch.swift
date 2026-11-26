@@ -408,6 +408,12 @@ final class SmartCorrector {
     }
 
     /// `valid`: the word is in the dictionary (then only a rare word one slip from a very common one changes).
+    /// How plausible `word` is as meant in `lang` (itself, or its best correction minus the slip).
+    func reading(_ word: String, lang: String, prev: String?) -> Double {
+        guard let m = lang == "en" ? en : uk else { return -1e9 }
+        return withOptionalCString(prev) { p in kb_reading(m, word, p) }
+    }
+
     func correct(_ word: String, lang: String, prev: String?, next: String?, valid: Bool = false) -> String? {
         guard let m = lang == "en" ? en : uk else { return nil }
         var out = [CChar](repeating: 0, count: 256)
@@ -677,6 +683,9 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// over a Space brings the previous word back and editing it still works.
     private var history: [(keys: [Key], atStart: Bool, changed: Bool)] = []
     private var last: Correction?
+    /// The key that ended the word being checked: Space, or Return (with Shift if held). A fix types
+    /// it again after the corrected word, so a message is sent (or a line broken) with the fixed text.
+    private var endKey: (code: UInt16, shift: Bool) = (UInt16(kVK_Space), false)
 
     private var active: Bool { settings.enabled }
 
@@ -885,6 +894,7 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if isRepeat { reset("held Space"); atWordStart = true; return pass }
             let previousFixed = settings.enabled && settings.typoFixing == "smart" && fixPreviousWord(proxy)
             if !buffer.isEmpty, correct(proxy) { return nil }
+            if questionMark(proxy) { pushWord(buffer); buffer.removeAll(); atWordStart = true; return nil }
             pushWord(buffer)
             buffer.removeAll(); atWordStart = true
             if previousFixed { post(UInt16(kVK_Space), " ", shift: false, proxy); return nil }   // keep the order
@@ -897,6 +907,17 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             else { atWordStart = false }                     // deleting into text we never saw
         case kVK_Return, kVK_ANSI_KeypadEnter:
+            // Check the last word first, like Space does: the fix goes in before the Return.
+            if !isRepeat, !buffer.isEmpty {
+                endKey = (UInt16(code), flags.contains(.maskShift))
+                let fixed = correct(proxy)
+                let question = !fixed && questionMark(proxy)
+                endKey = (UInt16(kVK_Space), false)
+                if fixed || question {
+                    buffer.removeAll(); history.removeAll(); atWordStart = true; last = nil
+                    return nil
+                }
+            }
             // A new line starts, or a message was sent: earlier words can't be returned to safely.
             buffer.removeAll(); history.removeAll(); atWordStart = true
         default:
@@ -1005,6 +1026,16 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let fromChars = typedInEnglish ? enChars : ukChars
         let newChars = typedInEnglish ? ukChars : enChars
         let typed = fromChars.joined(), converted = newChars.joined()
+        // Smart: you were writing in this language and the word is a typo of a word in it that
+        // happens to spell a word in the other layout (wdsnt → цвіте, meant wasnt): don't convert.
+        if settings.typoFixing == "smart", smart.ready, field == .verified,
+           let before = earlierWord(1, in: pair.from, pair.from.lang), lexicon.isWord(before, pair.from.lang) {
+            let asTypo = smart.reading(typed.lowercased(), lang: pair.from.lang, prev: before)
+            let asLayout = smart.reading(converted.lowercased(), lang: pair.to.lang, prev: nil)
+            if asTypo > asLayout - 7.5 {
+                return skip("'\(typed)' after '\(before)' looks like a \(pair.from.lang) typo, not '\(converted)' (\(Int(asTypo)) vs \(Int(asLayout)))")
+            }
+        }
         // From here on the keys carry the characters that are really on screen.
         buffer = zip(buffer, fromChars).map { Key(code: $0.code, shift: $0.shift, caps: $0.caps, char: $1) }
 
@@ -1047,7 +1078,7 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
             post(UInt16(kVK_Space), " ", shift: false, proxy)
         }
         for (key, c) in zip(buffer, newChars) { post(key.code, c, shift: key.shift, proxy) }
-        post(UInt16(kVK_Space), " ", shift: false, proxy)
+        postEnd(proxy)
         selectLayout(pair.to.source)
 
         let space = Key(code: UInt16(kVK_Space), shift: false, caps: false, char: " ")
@@ -1141,7 +1172,7 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 allMapped = false
             }
         }
-        post(UInt16(kVK_Space), " ", shift: false, proxy)
+        postEnd(proxy)
 
         var typedKeys = zip(buffer, enChars).map { Key(code: $0.code, shift: $0.shift, caps: $0.caps, char: $1) }
         var words = [current.word]
@@ -1215,7 +1246,7 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 post(0, ch, shift: false, proxy)
             }
         }
-        post(UInt16(kVK_Space), " ", shift: false, proxy)
+        postEnd(proxy)
         if target.lang != screen.lang { selectLayout(target.layout.source) }
 
         let typedKeys = zip(buffer, screen.chars).map { Key(code: $0.code, shift: $0.shift, caps: $0.caps, char: $1) }
@@ -1368,7 +1399,8 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let newPrev = zip(prev.keys, toChars).map { Key(code: $0.code, shift: $0.shift, caps: $0.caps, char: $1) }
         let curKeys = zip(buffer, current).map { Key(code: $0.code, shift: $0.shift, caps: $0.caps, char: $1) }
         let space = Key(code: UInt16(kVK_Space), shift: false, caps: false, char: " ")
-        for k in newPrev + [space] + curKeys + [space] { post(k.code, k.char, shift: k.shift, proxy) }
+        for k in newPrev + [space] + curKeys { post(k.code, k.char, shift: k.shift, proxy) }
+        postEnd(proxy)
 
         let oldPrev = zip(prev.keys, fromChars).map { Key(code: $0.code, shift: $0.shift, caps: $0.caps, char: $1) }
         last = Correction(typed: oldPrev + [space] + curKeys, inserted: to + " " + cur,
@@ -1408,6 +1440,32 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         buffer.removeAll()
         atWordStart = true
         return true
+    }
+
+    /// "word&" + Space/Return → "word?": & is Shift+7 in English, where Ukrainian has ?. Only an &
+    /// stuck to the end of a word; "you & me" and "&&" stay.
+    private func questionMark(_ proxy: CGEventTapProxy) -> Bool {
+        guard settings.enabled, buffer.count >= 2, let en = layouts.english,
+              en.char(for: buffer[buffer.count - 1]) == "&",
+              let before = en.char(for: buffer[buffer.count - 2])?.first, before.isLetter else { return false }
+        let chars = buffer.compactMap { en.char(for: $0) }
+        guard chars.count == buffer.count, FocusedField.check(candidates: [chars.joined()]) == .verified else {
+            DebugLog.write("? skip: field doesn't show '\(chars.joined())'")
+            return false
+        }
+        DebugLog.write("'\(chars.joined())' → '\(chars.dropLast().joined())?'")
+        post(UInt16(kVK_Delete), nil, shift: false, proxy)
+        post(buffer[buffer.count - 1].code, "?", shift: true, proxy)
+        postEnd(proxy)
+        let typed = zip(buffer, chars).map { Key(code: $0.code, shift: $0.shift, caps: $0.caps, char: $1) }
+        last = Correction(typed: typed, inserted: chars.dropLast().joined() + "?", from: en.source, words: [], time: Date())
+        buffer = Array(typed.dropLast()) + [Key(code: typed[typed.count - 1].code, shift: true, caps: false, char: "?")]
+        return true
+    }
+
+    /// Types the key that ended the word (see `endKey`).
+    private func postEnd(_ proxy: CGEventTapProxy) {
+        post(endKey.code, endKey.code == UInt16(kVK_Space) ? " " : nil, shift: endKey.shift, proxy)
     }
 
     /// Synthetic key press inserted right after this tap, i.e. before any keys still in flight.

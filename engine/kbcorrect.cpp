@@ -439,6 +439,28 @@ int kb_knows(KBModel* m, const char* word) {
 
 void kb_set_budget(KBModel* m, int candidates) { if (m && candidates > 0) m->budget = candidates; }
 
+double kb_reading(KBModel* m, const char* typedUtf8, const char* prevUtf8) {
+    if (!m || !typedUtf8) return -1e9;
+    u32 typed = decode(typedUtf8);
+    if (typed.empty()) return -1e9;
+    int prev = -1;
+    if (prevUtf8) prev = prevUtf8[0] ? findWord(m, decode(prevUtf8)) : (int)m->startId;
+    int typedId = findWord(m, typed);
+    double best = -1e9;
+    if ((typedId >= 0 && (trusted(m, typedId) || m->uni[typedId] >= kCommonWord)) || isLearned(m, typed))
+        best = conditional(m, prev, typedId, typed);
+    if (typed.size() < 3) return best;
+    std::vector<Candidate> cands;
+    search(m, typed, std::min(2, maxEditsFor(typed.size())), cands);
+    int looked = 0;
+    for (const Candidate& c : cands) {
+        if (c.text == typed || c.text.size() < 3) continue;
+        if (++looked > m->budget) break;
+        best = std::max(best, conditional(m, prev, c.id, c.text) - typingCost(m, typed, c.text));
+    }
+    return best;
+}
+
 int kb_correct(KBModel* m, const char* typedUtf8, const char* prevUtf8, const char* nextUtf8, int typedValid,
                char* out, int outSize, double* margin) {
     if (margin) *margin = 0;
