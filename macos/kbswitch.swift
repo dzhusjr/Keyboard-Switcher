@@ -1279,7 +1279,11 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let typedKeys = zip(buffer, screen.chars).map { Key(code: $0.code, shift: $0.shift, caps: $0.caps, char: $1) }
         last = Correction(typed: typedKeys, inserted: fixed, from: screen.layout.source, words: [screen.text], time: Date())
-        if newKeys.count == fixed.count { pushWord(newKeys, changed: true) } else { history.removeAll() }
+        if newKeys.count == fixed.count {
+            // A missed Space fixed (andthe → and the): two words in the history.
+            let parts = newKeys.split(whereSeparator: { $0.char == " " })
+            for part in parts { pushWord(Array(part), changed: true) }
+        } else { history.removeAll() }
         translitStreak = false
         buffer.removeAll()
         atWordStart = true

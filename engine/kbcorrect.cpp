@@ -68,6 +68,18 @@ const double kRealWordMargin = KB_RW_MARGIN;                               // ..
 #endif
 const double kRareWord     = std::log(std::pow(10.0, KB_RARE - 9));  // rarer than this: seen in text, but likely a typo there too
 const double kLearnedWord   = std::log(std::pow(10.0, 3.5 - 9));   // user's own words
+#ifndef KB_SHRINK
+#define KB_SHRINK 3.0
+#endif
+#ifndef KB_SPLIT_LEN
+#define KB_SPLIT_LEN 1.5
+#endif
+#ifndef KB_SPACE
+#define KB_SPACE 2.0
+#endif
+const double kMissedSpace = KB_SPACE;                              // two words typed without the Space
+const double kSplitTiny  = std::log(std::pow(10.0, 5.5 - 9));     // a/i/в/і...: only very common ones
+const double kSplitShort = std::log(std::pow(10.0, 4.5 - 9));     // 2-letter parts: common ones
 const double kKeepBonus     = 1.0;    // typing what you meant is likelier than any particular slip
 const double kNotInDictionary = 3.0;  // a word the dictionary doesn't know is often a frequent misspelling
 
@@ -523,14 +535,41 @@ int kb_correct(KBModel* m, const char* typedUtf8, const char* prevUtf8, const ch
         if (realWord && (c.id < 0 || m->uni[c.id] < kCommonRealWord || distance(typed, c.text) != 1)) continue;
         if (++looked > m->budget) return 0;
         double s = score(c.id, c.text) - typingCost(m, typed, c.text);
+        // Typing two or more letters too many is rarer than each extra letter alone suggests
+        // (bwteen is between, not been).
+        if (typed.size() >= c.text.size() + 2) s -= KB_SHRINK * (typed.size() - c.text.size() - 1);
         if (s > best) { second = best; runnerUp = winner; best = s; winner = c.text; }
         else if (s > second) { second = s; runnerUp = c.text; }
+    }
+    // A missed Space: two common dictionary words run together (andthe -> and the).
+    if (!realWord && typed.size() >= 4) {
+        auto part = [&](const u32& w) {
+            int id = findWord(m, w);
+            if (id < 0 || !trusted(m, id)) return -1;
+            double need = w.size() == 1 ? kSplitTiny : w.size() == 2 ? kSplitShort : kCommonWord;
+            return m->uni[id] >= need ? id : -1;
+        };
+        for (size_t i = 1; i < typed.size(); i++) {
+            u32 a = typed.substr(0, i), b = typed.substr(i);
+            if (a.back() == U'\'' || b.front() == U'\'' || b.front() == U'-' || a.back() == U'-') continue;
+            int ia = part(a), ib = part(b);
+            if (ia < 0 || ib < 0) continue;
+            // One long unknown string is less likely than an unknown short one: the longer the run,
+            // the more two real words explain it.
+            double s = conditional(m, prev, ia, a) + conditional(m, ia, ib, b) - kMissedSpace +
+                       KB_SPLIT_LEN * std::max(0, (int)typed.size() - 6);
+            if (nextId >= 0) s += kRightWeight * (conditional(m, ib, nextId, next) - m->uni[nextId]);
+            u32 text = a + U" " + b;
+            if (s > best) { second = best; runnerUp = winner; best = s; winner = text; }
+            else if (s > second) { second = s; runnerUp = text; }
+        }
     }
     if (winner.empty()) return 0;
     if (m->ukrainian && orthographyKey(winner) == orthographyKey(typed)) return 0;
     double lead = best - keep;
     if (margin) *margin = lead;
-    double needed = realWord ? kRealWordMargin : kNonWordMargin + kExtraEditMargin * (distance(typed, winner) - 1) + (typedId < 0 ? 0 : m->uni[typedId] >= kRareWord ? kSeenWordMargin : kSeenWordMargin / 2);
+    bool split = winner.find(U' ') != u32::npos;
+    double needed = split ? kNonWordMargin + (typedId >= 0 ? kSeenWordMargin / 2 : 0) : realWord ? kRealWordMargin : kNonWordMargin + kExtraEditMargin * (distance(typed, winner) - 1) + (typedId < 0 ? 0 : m->uni[typedId] >= kRareWord ? kSeenWordMargin : kSeenWordMargin / 2);
     if (lead < needed) return 0;
     // Too close to call - unless the runner-up needs more edits than the winner (mistakess: mistakes
     // vs mistake), where the nearer word is the safer reading.
