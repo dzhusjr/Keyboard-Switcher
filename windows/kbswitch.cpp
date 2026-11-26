@@ -856,8 +856,8 @@ public:
                 atWordStart_ = true;
                 break;
             case VK_BACK:
-                if (repeat) reset(L"held Backspace");
-                else if (!buffer_.empty()) buffer_.pop_back();
+                // Held Backspace repeats: each repeat deletes one character, like a single press.
+                if (!buffer_.empty()) buffer_.pop_back();
                 else if (!history_.empty()) {               // deleted a Space: back into the previous word
                     buffer_ = history_.back().keys;
                     history_.pop_back();

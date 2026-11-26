@@ -610,6 +610,28 @@ enum FocusedField {
         return result
     }
 
+    /// The word right before the caret (back to whitespace, an opening bracket or the start of the
+    /// text), or nil if the focused element isn't a readable text field or there's a selection.
+    static func wordBeforeCaret(maxLength: Int = 48) -> String? {
+        let system = AXUIElementCreateSystemWide()
+        AXUIElementSetMessagingTimeout(system, 0.08)
+        guard let f = attr(system, kAXFocusedUIElementAttribute),
+              CFGetTypeID(f) == AXUIElementGetTypeID() else { return nil }
+        let el = f as! AXUIElement
+        AXUIElementSetMessagingTimeout(el, 0.08)
+        if (attr(el, kAXSubroleAttribute) as? String) == kAXSecureTextFieldSubrole { return nil }
+        guard let rv = attr(el, kAXSelectedTextRangeAttribute), CFGetTypeID(rv) == AXValueGetTypeID() else { return nil }
+        var sel = CFRange()
+        guard AXValueGetValue(rv as! AXValue, .cfRange, &sel), sel.length == 0 else { return nil }
+        usleep(15_000)                                   // let the app draw the last keystrokes
+        let from = max(0, sel.location - maxLength - 1)
+        guard let text = string(el, CFRange(location: from, length: sel.location - from)) else { return nil }
+        if let i = text.lastIndex(where: { $0.isWhitespace || openers.contains($0) }) {
+            return String(text[text.index(after: i)...])
+        }
+        return from == 0 ? text : nil                    // no boundary within reach: give up
+    }
+
     private static func compare(_ el: AXUIElement, _ candidates: [String]) -> FieldState {
         guard let rv = attr(el, kAXSelectedTextRangeAttribute),
               CFGetTypeID(rv) == AXValueGetTypeID() else { return .unverified }
@@ -679,6 +701,7 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // Typing state
     private var buffer: [Key] = []
     private var atWordStart = false     // a word boundary was seen right before `buffer`
+    private var wordEdited = false      // Backspace was used in this word: re-read it from the field
     /// Words (and empty gaps) before each Space typed since the last reset, so that backspacing
     /// over a Space brings the previous word back and editing it still works.
     private var history: [(keys: [Key], atStart: Bool, changed: Bool)] = []
@@ -828,7 +851,7 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if DebugLog.on, !buffer.isEmpty || !history.isEmpty || atWordStart {
             DebugLog.write("forget word \(spell(buffer)): \(why)")
         }
-        buffer.removeAll(); atWordStart = false; last = nil; history.removeAll()
+        buffer.removeAll(); atWordStart = false; last = nil; history.removeAll(); wordEdited = false
     }
 
     private var ownSwitchUntil = Date.distantPast
@@ -847,6 +870,7 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// `changed`: KBSwitch converted this word (or the user undid a conversion): leave it alone later.
     private func pushWord(_ keys: [Key], changed: Bool = false) {
+        wordEdited = false
         history.append((keys, atWordStart, changed))
         if history.count > 10 { history.removeFirst() }
     }
@@ -892,6 +916,7 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         switch code {
         case kVK_Space:
             if isRepeat { reset("held Space"); atWordStart = true; return pass }
+            if settings.enabled, wordEdited || (!atWordStart && !buffer.isEmpty) { rereadWord() }
             let previousFixed = settings.enabled && settings.typoFixing == "smart" && fixPreviousWord(proxy)
             if !buffer.isEmpty, correct(proxy) { return nil }
             if questionMark(proxy) { pushWord(buffer); buffer.removeAll(); atWordStart = true; return nil }
@@ -899,8 +924,10 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
             buffer.removeAll(); atWordStart = true
             if previousFixed { post(UInt16(kVK_Space), " ", shift: false, proxy); return nil }   // keep the order
         case kVK_Delete:
-            if isRepeat { reset("held Backspace") }
-            else if !buffer.isEmpty { buffer.removeLast() }
+            // Held Backspace repeats: each repeat deletes one character, like a single press.
+            // The word is re-read from the field at Space/Return anyway (`wordEdited`).
+            wordEdited = true
+            if !buffer.isEmpty { buffer.removeLast() }
             else if let prev = history.popLast() {           // deleted a Space: back into the previous word
                 buffer = prev.keys; atWordStart = prev.atStart
                 DebugLog.write("backspace over Space: back into \(spell(buffer))")
@@ -908,6 +935,7 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
             else { atWordStart = false }                     // deleting into text we never saw
         case kVK_Return, kVK_ANSI_KeypadEnter:
             // Check the last word first, like Space does: the fix goes in before the Return.
+            if settings.enabled, !isRepeat, wordEdited || (!atWordStart && !buffer.isEmpty) { rereadWord() }
             if !isRepeat, !buffer.isEmpty {
                 endKey = (UInt16(code), flags.contains(.maskShift))
                 let fixed = correct(proxy)
@@ -1461,6 +1489,35 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         last = Correction(typed: typed, inserted: chars.dropLast().joined() + "?", from: en.source, words: [], time: Date())
         buffer = Array(typed.dropLast()) + [Key(code: typed[typed.count - 1].code, shift: true, caps: false, char: "?")]
         return true
+    }
+
+    /// After Backspace, arrows or clicks the keys we saw may not be the word on screen (typos fixed
+    /// by hand, a word whose start we missed). Read the word before the caret and rebuild its keys:
+    /// each character from the layout that has it, preferring the layout most of its letters are in.
+    private func rereadWord() {
+        wordEdited = false
+        guard let en = layouts.english, let uk = layouts.ukrainian,
+              let word = FocusedField.wordBeforeCaret(), !word.isEmpty, word.count <= settings.maxLength else {
+            DebugLog.write("re-read: field unreadable, keeping \(spell(buffer))")
+            return
+        }
+        let chars = word.map(String.init)
+        let inUk = chars.filter { $0.first.map { Decision.isLetter($0, "uk") } == true }.count
+        let inEn = chars.filter { $0.first.map { Decision.isLetter($0, "en") } == true }.count
+        let order = inUk > inEn ? [uk, en] : [en, uk]
+        var keys: [Key] = []
+        for ch in chars {
+            guard let k = order[0].keyFor[ch] ?? order[1].keyFor[ch] else {
+                DebugLog.write("re-read: '\(ch)' in '\(word)' has no key, keeping \(spell(buffer))")
+                return
+            }
+            keys.append(Key(code: k.code, shift: k.shift, caps: false, char: ch))
+        }
+        if keys.map({ $0.char }) != buffer.map({ $0.char }) || !atWordStart {
+            DebugLog.write("re-read: \(spell(buffer)) → '\(word)' from the field")
+        }
+        buffer = keys
+        atWordStart = true
     }
 
     /// Types the key that ended the word (see `endKey`).
