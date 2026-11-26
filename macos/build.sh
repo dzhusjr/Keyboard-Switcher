@@ -48,9 +48,11 @@ fi
 
 echo "→ Compiling"
 rm -rf build && mkdir -p "$OUT/Contents/MacOS" "$OUT/Contents/Resources"
-swiftc -O -swift-version 5 -import-objc-header ../hunspell/bridge.h -Xcc -DHUNSPELL_STATIC -Xcc -I../hunspell \
-  kbswitch.swift "$HSOBJ"/*.o -lc++ -o "$OUT/Contents/MacOS/kbswitch"
-cp "$CACHE/uk_UA.aff" "$CACHE/uk_UA.dic" "$OUT/Contents/Resources/"
+# The typo-correction engine (../engine) is shared with the Windows version.
+clang++ -c -O2 -std=c++17 -w -I../engine ../engine/kbcorrect.cpp -o build/kbcorrect.o
+swiftc -O -swift-version 5 -import-objc-header bridge.h -Xcc -DHUNSPELL_STATIC -Xcc -I../hunspell -Xcc -I../engine \
+  kbswitch.swift "$HSOBJ"/*.o build/kbcorrect.o -lc++ -o "$OUT/Contents/MacOS/kbswitch"
+cp "$CACHE/uk_UA.aff" "$CACHE/uk_UA.dic" ../model/en.kbm ../model/uk.kbm "$OUT/Contents/Resources/"
 cp Resources/MenuBarIcon.png Resources/MenuBarIcon@2x.png "$OUT/Contents/Resources/"
 # App icon: built from AppIcon.png with Apple's own tools so Finder/Spotlight/Dock read it reliably.
 ICONSET=$(mktemp -d)/AppIcon.iconset

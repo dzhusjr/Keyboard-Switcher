@@ -116,7 +116,20 @@ are also English (`yak`, `tak`) are converted only in context: right after a con
 with the next word once that one converts (`yak spravy` → **як справи**). It keeps your layout, and the
 undo key reverts it. Off by default.
 
-**Optional: fix typos.** Turn on *Fix typos* and a word that isn't a word in either language, but is
+**Optional: fix typos.** *Fix typos* has three settings: **Off** (default), **Careful** and **Smart**.
+
+*Smart* (macOS for now) uses an offline language model of English and Ukrainian (word frequencies,
+slang included, and which words follow which; see [model/SOURCES.md](model/SOURCES.md)) plus a
+model of how people mistype on a keyboard. It fixes badly mangled words using the word before
+(`ckasroom` → **classroom**, `зроблю тобы` → **зроблю тобі**), and when the next word arrives it
+looks again at a previous word it left alone, now with context on both sides. It never changes a
+word that is in the dictionary or one you write often (slang such as `норм`, `кринж` or `lol` stays),
+and it only corrects when one answer is clearly ahead. On test text it fixed 78% of English typos with
+1.4% wrong fixes and changed 0.1–0.4% of correctly spelled words. A check takes about 0.4 ms and
+the data uses about 20 MB of memory, loaded only when Smart is on. Words in *Never convert* and words
+whose correction you undo are learned.
+
+*Careful*: a word that isn't a word in either language, but is
 one common slip away from exactly one word, is corrected when you press Space: two letters swapped
 (`implemnet` → **implement**), a neighbouring key inside a 5+ letter word (`hwllo` → **hello**), a
 doubled letter or a double typed once (`adress` → **address**, `приивіт` → **привіт**). It also works

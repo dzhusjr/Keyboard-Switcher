@@ -79,7 +79,7 @@ struct Config {
     var excludedApps: Set<String> = ["com.apple.Terminal", "com.googlecode.iterm2"]
     var debugLog = false
     var transliteration = false
-    var autocorrect = false
+    var typoFixing = "off"          // off | careful | smart
     var englishLayout = "auto"
     var ukrainianLayout = "auto"
     var exceptions = Set<String>()
@@ -109,7 +109,8 @@ struct Config {
             case "menu_bar_icon": s.menuBarIcon = flag
             case "debug_log": s.debugLog = flag
             case "transliteration": s.transliteration = flag
-            case "autocorrect": s.autocorrect = flag
+            case "autocorrect": if flag && s.typoFixing == "off" { s.typoFixing = "careful" }   // older setting
+            case "typo_fixing": if ["off", "careful", "smart"].contains(value.lowercased()) { s.typoFixing = value.lowercased() }
             case "english_layout": s.englishLayout = value
             case "ukrainian_layout": s.ukrainianLayout = value
             case "excluded_apps":
@@ -140,7 +141,7 @@ struct Config {
         ukrainian_layout = \(ukrainianLayout)
         debug_log = \(debugLog)
         transliteration = \(transliteration)
-        autocorrect = \(autocorrect)
+        typo_fixing = \(typoFixing)
 
         """
         try? FileManager.default.createDirectory(at: Files.dir, withIntermediateDirectories: true)
@@ -366,6 +367,54 @@ enum Typos {
             var c = w; c.insert(w[i], at: i); if !consider(c) { return nil }
         }
         return found.count == 1 ? found.first : nil
+    }
+}
+
+// MARK: - Smart typo fixing (shared C++ engine, ../engine)
+
+private func withOptionalCString<R>(_ s: String?, _ body: (UnsafePointer<CChar>?) -> R) -> R {
+    if let s = s { return s.withCString { body($0) } }
+    return body(nil)
+}
+
+/// English and Ukrainian language models (word frequencies + word pairs, ../model/*.kbm), loaded in
+/// the background so starting the app stays instant. Used on the main thread only.
+final class SmartCorrector {
+    private var en: OpaquePointer?
+    private var uk: OpaquePointer?
+    private var loading = false
+    var ready: Bool { en != nil && uk != nil }
+
+    func load(keys: [(lang: String, code: UInt32, row: Int32, col: Int32)], learned: [String]) {
+        guard !ready, !loading else { learn(learned); return }
+        loading = true
+        DispatchQueue.global(qos: .utility).async {
+            let e = Bundle.main.path(forResource: "en", ofType: "kbm").flatMap { kb_load($0) }
+            let u = Bundle.main.path(forResource: "uk", ofType: "kbm").flatMap { kb_load($0) }
+            DispatchQueue.main.async {
+                self.en = e
+                self.uk = u
+                self.loading = false
+                for k in keys { kb_set_key(k.lang == "en" ? e : u, k.code, k.row, k.col) }
+                self.learn(learned)
+                DebugLog.write("smart typo fixing: language data \(self.ready ? "loaded" : "MISSING")")
+            }
+        }
+    }
+
+    /// Words the user writes on purpose: never corrected, may be suggested.
+    func learn(_ words: [String]) {
+        for w in words { kb_learn(en, w); kb_learn(uk, w) }
+    }
+
+    func correct(_ word: String, lang: String, prev: String?, next: String?) -> String? {
+        guard let m = lang == "en" ? en : uk else { return nil }
+        var out = [CChar](repeating: 0, count: 256)
+        let size = Int32(out.count)
+        let ok = withOptionalCString(prev) { p in
+            withOptionalCString(next) { n in kb_correct(m, word, p, n, 0, &out, size, nil) }
+        }
+        return ok == 1 ? String(cString: out) : nil
     }
 }
 
@@ -610,6 +659,7 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var stamps: [Date?] = [nil, nil]
     private let layouts = Layouts()
     private let lexicon = Lexicon()
+    private let smart = SmartCorrector()
     private let eventSource = CGEventSource(stateID: .privateState)
     private var tap: CFMachPort?
     private var statusItem: NSStatusItem?
@@ -729,8 +779,23 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         stamps = [Files.modified(Files.settings), Files.modified(Files.exceptions)]
         layouts.reload(settings)
         lexicon.reloadWordLists()
+        if settings.typoFixing == "smart" { startSmart() }
         if DebugLog.on && !wasLogging { DebugLog.start(diagnostics()) }
         updateMenu()
+    }
+
+    /// Loads the language data (once) and tells it the keyboard and the user's own words.
+    private func startSmart() {
+        var keys: [(lang: String, code: UInt32, row: Int32, col: Int32)] = []
+        for (lang, layout) in [("en", layouts.english), ("uk", layouts.ukrainian)] {
+            guard let layout = layout, let letters = Typos.alphabet[lang] else { continue }
+            for ch in letters where ch != "'" {
+                guard let k = layout.keyFor[String(ch)], let p = Typos.grid[k.code],
+                      let scalar = ch.unicodeScalars.first else { continue }
+                keys.append((lang, scalar.value, Int32(p.row), Int32(p.col)))
+            }
+        }
+        smart.load(keys: keys, learned: Array(settings.exceptions.union(sessionIgnore)))
     }
 
     private func diagnostics() -> String {
@@ -741,6 +806,7 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         English layout: \(layouts.english?.id ?? "NOT FOUND") · Ukrainian layout: \(layouts.ukrainian?.id ?? "NOT FOUND") · current: \(Layouts.currentID())
         en: \(lexicon.describe("en")) · uk: \(lexicon.describe("uk"))
         Accessibility: \(AXIsProcessTrusted()) · event tap: \(tap != nil) · secure input: \(IsSecureEventInputEnabled() == true)
+        typo fixing: \(settings.typoFixing)\(settings.typoFixing == "smart" ? (smart.ready ? " (language data loaded)" : " (loading)") : "")
         min=\(settings.minLength) max=\(settings.maxLength) undo=\(settings.undoKey) textFieldsOnly=\(settings.requireTextField) excluded=\(settings.excludedApps.sorted())
         """
     }
@@ -816,9 +882,11 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         switch code {
         case kVK_Space:
             if isRepeat { reset("held Space"); atWordStart = true; return pass }
+            let previousFixed = settings.enabled && settings.typoFixing == "smart" && fixPreviousWord(proxy)
             if !buffer.isEmpty, correct(proxy) { return nil }
             pushWord(buffer)
             buffer.removeAll(); atWordStart = true
+            if previousFixed { post(UInt16(kVK_Space), " ", shift: false, proxy); return nil }   // keep the order
         case kVK_Delete:
             if isRepeat { reset("held Backspace") }
             else if !buffer.isEmpty { buffer.removeLast() }
@@ -901,7 +969,8 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                         minLength: settings.minLength, exceptions: exceptions, isWord: lexicon.isWord)
         if let a = enToUk, let b = ukToEn {
             if settings.transliteration, transliterate(enChars, appID, streak: streak, proxy) { return true }
-            if settings.autocorrect, fixTypo(enChars, ukChars, appID, proxy) { return true }
+            if settings.typoFixing == "careful", fixTypo(enChars, ukChars, appID, proxy) { return true }
+            if settings.typoFixing == "smart", smartFix(enChars, ukChars, appID, proxy) { return true }
             return skip("en '\(enText)' / uk '\(ukText)': nothing to fix (en→uk: \(a); uk→en: \(b))")
         }
 
@@ -1106,7 +1175,6 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let field = FocusedField.check(candidates: [enText, ukText])
         guard field == .verified else { return skip("field check: \(field) in \(appID)") }
         let onScreenEnglish = FocusedField.matched == 0
-        typealias Side = (text: String, lang: String, layout: KeyLayout, plain: Bool, chars: [String])
         let enSide: Side = (enText, "en", en, enPlain, enChars), ukSide: Side = (ukText, "uk", uk, ukPlain, ukChars)
         let screen = onScreenEnglish ? enSide : ukSide, other = onScreenEnglish ? ukSide : enSide
 
@@ -1125,7 +1193,13 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let fixed = fix else { return skip("no single word one letter away from '\(screen.text)'") }
         guard !exceptions.contains(fixed) else { return skip("'\(fixed)' is in exceptions") }
         DebugLog.write("typo: '\(screen.text)' → '\(fixed)' in \(appID)")
+        return replaceWord(screen: screen, target: target, fixed: fixed, proxy)
+    }
 
+    typealias Side = (text: String, lang: String, layout: KeyLayout, plain: Bool, chars: [String])
+
+    /// Deletes the word on screen and types `fixed` (switching layout if it's in the other language).
+    private func replaceWord(screen: Side, target: Side, fixed: String, _ proxy: CGEventTapProxy) -> Bool {
         for _ in buffer { post(UInt16(kVK_Delete), nil, shift: false, proxy) }
         var newKeys: [Key] = []
         for ch in fixed.map(String.init) {
@@ -1148,6 +1222,104 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return true
     }
 
+    /// Smart mode: the language model picks the most likely word for a non-word, using the word
+    /// before it, word frequencies (including slang) and a keyboard-aware typing model. Tried on the
+    /// spelling on screen first, then on the other layout's spelling (wrong layout and a typo).
+    private func smartFix(_ enChars: [String], _ ukChars: [String], _ appID: String, _ proxy: CGEventTapProxy) -> Bool {
+        func skip(_ why: String) -> Bool { DebugLog.write("smart skip: \(why)"); return false }
+        guard smart.ready else { return skip("language data still loading") }
+        guard buffer.count >= 3, let en = layouts.english, let uk = layouts.ukrainian else { return false }
+        let enText = enChars.joined(), ukText = ukChars.joined()
+        let enPlain = Typos.isPlain(enText, "en"), ukPlain = Typos.isPlain(ukText, "uk")
+        guard enPlain || ukPlain else { return skip("'\(enText)' / '\(ukText)' is not a plain lowercase word") }
+        let exceptions = settings.exceptions.union(sessionIgnore)
+        guard !exceptions.contains(enText), !exceptions.contains(ukText) else { return skip("in exceptions") }
+        guard !lexicon.isWord(enText, "en"), !lexicon.isWord(ukText, "uk") else { return false }
+
+        let field = FocusedField.check(candidates: [enText, ukText])
+        guard field == .verified else { return skip("field check: \(field) in \(appID)") }
+        let onScreenEnglish = FocusedField.matched == 0
+        let enSide: Side = (enText, "en", en, enPlain, enChars), ukSide: Side = (ukText, "uk", uk, ukPlain, ukChars)
+        let screen = onScreenEnglish ? enSide : ukSide, other = onScreenEnglish ? ukSide : enSide
+
+        func attempt(_ side: Side) -> String? {
+            guard side.plain else { return nil }
+            return smart.correct(side.text, lang: side.lang, prev: earlierWord(1, in: side.layout, side.lang), next: nil)
+        }
+        var target = screen
+        var fix = attempt(screen)
+        if fix == nil, let f = attempt(other) { fix = f; target = other }    // wrong layout and a typo
+        guard let fixed = fix else { return skip("no confident correction for '\(screen.text)'") }
+        guard !exceptions.contains(fixed) else { return skip("'\(fixed)' is in exceptions") }
+        DebugLog.write("smart: '\(screen.text)' → '\(fixed)' in \(appID)")
+        return replaceWord(screen: screen, target: target, fixed: fixed, proxy)
+    }
+
+    /// The word `back` places before the current one, spelled in a layout, if it's a plain word.
+    private func earlierWord(_ back: Int, in layout: KeyLayout, _ lang: String) -> String? {
+        guard history.count >= back else { return nil }
+        let keys = history[history.count - back].keys
+        let chars = keys.compactMap { layout.char(for: $0) }
+        guard !keys.isEmpty, chars.count == keys.count else { return nil }
+        let w = chars.joined().lowercased()
+        return Typos.isPlain(w, lang) ? w : nil
+    }
+
+    /// Smart mode, on Space: the previous word, if KBSwitch left it unchanged and it's a word in neither
+    /// layout, is checked again now that the word after it is known (context on both sides). The field
+    /// must show exactly "previous word + this word". Returns true if it was replaced.
+    private func fixPreviousWord(_ proxy: CGEventTapProxy) -> Bool {
+        guard smart.ready, let en = layouts.english, let uk = layouts.ukrainian,
+              let prev = history.last, !prev.changed, !prev.keys.isEmpty, !buffer.isEmpty else { return false }
+        func spell(_ keys: [Key], _ l: KeyLayout) -> String? {
+            let c = keys.compactMap { l.char(for: $0) }
+            return c.count == keys.count ? c.joined() : nil
+        }
+        guard let pEn = spell(prev.keys, en), let pUk = spell(prev.keys, uk),
+              let cEn = spell(buffer, en), let cUk = spell(buffer, uk) else { return false }
+        let exceptions = settings.exceptions.union(sessionIgnore)
+        // Cheap checks first: almost every previous word is a real word and stops here.
+        guard Typos.isPlain(pEn, "en") || Typos.isPlain(pUk, "uk"),
+              !lexicon.isWord(pEn, "en"), !lexicon.isWord(pUk, "uk"),
+              !exceptions.contains(pEn), !exceptions.contains(pUk) else { return false }
+        let combos = [(pEn, cEn), (pUk, cUk), (pEn, cUk), (pUk, cEn)]
+        guard FocusedField.check(candidates: combos.map { $0.0 + " " + $0.1 }) == .verified else { return false }
+        let i = FocusedField.matched
+        let prevEnglish = i == 0 || i == 2
+        let layout = prevEnglish ? en : uk, lang = prevEnglish ? "en" : "uk"
+        let prevText = prevEnglish ? pEn : pUk
+        let current = combos[i].1, currentLayout = (i == 0 || i == 3) ? en : uk
+        guard Typos.isPlain(prevText, lang) else { return false }
+        let meant = (prevEnglish ? cEn : cUk).lowercased()                  // this word, as meant in that language
+        guard let fixed = smart.correct(prevText, lang: lang, prev: earlierWord(2, in: layout, lang),
+                                        next: Typos.isPlain(meant, lang) ? meant : nil),
+              !exceptions.contains(fixed) else { return false }
+        DebugLog.write("smart (with the next word): '\(prevText) \(current)' → '\(fixed) \(current)'")
+
+        for _ in 0 ..< buffer.count + 1 + prev.keys.count { post(UInt16(kVK_Delete), nil, shift: false, proxy) }
+        var newKeys: [Key] = []
+        for ch in fixed.map(String.init) {
+            if let k = layout.keyFor[ch] {
+                post(k.code, ch, shift: k.shift, proxy)
+                newKeys.append(Key(code: k.code, shift: k.shift, caps: false, char: ch))
+            } else {
+                post(0, ch, shift: false, proxy)
+            }
+        }
+        post(UInt16(kVK_Space), " ", shift: false, proxy)
+        let currentKeys = buffer.map { Key(code: $0.code, shift: $0.shift, caps: $0.caps, char: currentLayout.char(for: $0) ?? $0.char) }
+        for k in currentKeys { post(k.code, k.char, shift: k.shift, proxy) }
+        buffer = currentKeys
+
+        history.removeLast()
+        if newKeys.count == fixed.count { history.append((newKeys, prev.atStart, true)) } else { history.removeAll() }
+        let prevKeys = zip(prev.keys, prevText.map(String.init)).map { Key(code: $0.code, shift: $0.shift, caps: $0.caps, char: $1) }
+        let space = Key(code: UInt16(kVK_Space), shift: false, caps: false, char: " ")
+        last = Correction(typed: prevKeys + [space] + currentKeys, inserted: fixed + " " + current,
+                          from: layout.source, words: [prevText], time: Date())
+        return true
+    }
+
     /// Reverts the last correction. Returns false (and lets the key through) if the text no longer matches.
     private func undo(_ c: Correction, _ proxy: CGEventTapProxy, learn: Bool) -> Bool {
         switch FocusedField.check(expect: c.inserted + " ") {
@@ -1164,6 +1336,7 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else if let top = history.popLast() {
             history.append((c.typed, top.atStart, true))           // the original is back (user's choice)
         }
+        smart.learn(c.words.map { $0.lowercased() })
         for w in c.words {
             sessionIgnore.insert(w.lowercased())
             // Backspace is also plain editing, so only an Esc undo is remembered for good.
@@ -1373,7 +1546,11 @@ struct SettingsView: View {
                 }
                 Toggle("Never convert words undone with Esc", isOn: $model.config.learnOnUndo)
                 Toggle("Ukrainian typed in Latin → Cyrillic (privit → привіт)", isOn: $model.config.transliteration)
-                Toggle("Fix typos (one letter off: implemnet → implement)", isOn: $model.config.autocorrect)
+                Picker("Fix typos", selection: $model.config.typoFixing) {
+                    Text("Off").tag("off")
+                    Text("Careful: one slip (implemnet)").tag("careful")
+                    Text("Smart: context, slang, badly mangled words").tag("smart")
+                }
             }
             Section {
                 TextEditor(text: $model.exceptions)
