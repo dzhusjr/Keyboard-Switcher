@@ -116,6 +116,15 @@ are also English (`yak`, `tak`) are converted only in context: right after a con
 with the next word once that one converts (`yak spravy` → **як справи**). It keeps your layout, and the
 undo key reverts it. Off by default.
 
+**Optional: fix typos.** Turn on *Fix typos* and a word that isn't a word in either language, but is
+one common slip away from exactly one word, is corrected when you press Space: two letters swapped
+(`implemnet` → **implement**), a neighbouring key inside a 5+ letter word (`hwllo` → **hello**), a
+doubled letter or a double typed once (`adress` → **address**, `приивіт` → **привіт**). It also works
+when the word was typed in the wrong layout as well. To avoid "correcting" what you meant, it leaves
+alone words under 4 letters, anything capitalized (names), anything with digits or symbols, stretched
+words (`hmmm`, `ахааа`) and every case with more than one possible word. Esc undoes a correction and
+remembers the word. Off by default.
+
 If a word isn't fixed and you don't know why, choose **Diagnostic Log** in the menu, reproduce it,
 then choose **Show Log**. Every key, every forgotten word and every skipped fix is logged with its
 reason. The log contains what you typed, so turn it off afterwards.

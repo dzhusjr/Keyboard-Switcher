@@ -32,6 +32,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <functional>
 #include <map>
@@ -174,6 +175,7 @@ struct Config {
     wstring undoKey = L"escape";               // escape | backspace | none
     bool learnOnUndo = true;
     bool transliteration = false;
+    bool autocorrect = false;
     bool debugLog = false;
     std::set<wstring> excludedApps = {L"cmd.exe", L"powershell.exe", L"pwsh.exe", L"windowsterminal.exe", L"conhost.exe"};
     std::set<wstring> exceptions;              // lowercase
@@ -197,6 +199,7 @@ struct Config {
             else if (key == L"undo_key") { wstring l = lower(v); c.undoKey = (l == L"none" || l == L"backspace") ? l : L"escape"; }
             else if (key == L"learn_on_undo") c.learnOnUndo = flag(v);
             else if (key == L"transliteration") c.transliteration = flag(v);
+            else if (key == L"autocorrect") c.autocorrect = flag(v);
             else if (key == L"debug_log") c.debugLog = flag(v);
             else if (key == L"excluded_apps") {
                 c.excludedApps.clear();
@@ -225,6 +228,7 @@ struct Config {
         t += L"undo_key = " + undoKey + L"\r\n";
         t += L"learn_on_undo = " + wstring(learnOnUndo ? L"true" : L"false") + L"\r\n";
         t += L"transliteration = " + wstring(transliteration ? L"true" : L"false") + L"\r\n";
+        t += L"autocorrect = " + wstring(autocorrect ? L"true" : L"false") + L"\r\n";
         t += L"debug_log = " + wstring(debugLog ? L"true" : L"false") + L"\r\n";
         t += L"excluded_apps = " + apps + L"\r\n";
         writeFile(g_paths->settings, t);
@@ -456,6 +460,75 @@ static std::optional<wstring> convert(const wstring& latin) {
 }
 
 }  // namespace Translit
+
+// ============================================================================================
+// Typos (optional): one letter off. Same rules as the macOS app.
+// ============================================================================================
+
+namespace Typos {
+
+static const wchar_t* alphabet(const wstring& lang) {
+    return lang == L"uk" ? L"абвгґдеєжзиіїйклмнопрстуфхцчшщьюя'" : L"abcdefghijklmnopqrstuvwxyz";
+}
+
+static bool isPlain(const wstring& w, const wstring& lang) {
+    if (w.empty() || w != lower(w) || w.front() == L'\'' || w.back() == L'\'') return false;
+    for (wchar_t c : w) if (!wcschr(alphabet(lang), c)) return false;
+    return true;
+}
+
+/// Row/column of the key that types `c` in a layout (letter rows), or false.
+static bool position(wchar_t c, HKL hkl, int& row, int& col) {
+    SHORT r = VkKeyScanExW(c, hkl);
+    if (r == -1) return false;
+    UINT scan = MapVirtualKeyExW(LOBYTE(r), MAPVK_VK_TO_VSC, hkl);
+    if (scan >= 0x10 && scan <= 0x1B) { row = 0; col = (int)scan - 0x10; return true; }
+    if (scan >= 0x1E && scan <= 0x28) { row = 1; col = (int)scan - 0x1E; return true; }
+    if (scan >= 0x2C && scan <= 0x35) { row = 2; col = (int)scan - 0x2C; return true; }
+    return false;
+}
+
+/// Keys that touch on a staggered keyboard: left/right, two above, two below.
+static bool touching(wchar_t a, wchar_t b, HKL hkl) {
+    int ra, ca, rb, cb;
+    if (!position(a, hkl, ra, ca) || !position(b, hkl, rb, cb)) return false;
+    switch (rb - ra) {
+        case 0: return std::abs(cb - ca) == 1;
+        case -1: return cb == ca || cb == ca + 1;
+        case 1: return cb == ca || cb == ca - 1;
+        default: return false;
+    }
+}
+
+/// The one word `word` becomes by undoing a single common slip (two neighbouring letters swapped,
+/// a key next to the intended one inside a 5+ letter word, a doubled letter, a double typed once),
+/// or nullopt if there is none, more than one, or the time budget runs out.
+static std::optional<wstring> correction(const wstring& word, const wstring& lang, HKL hkl, ULONGLONG deadline) {
+    size_t n = word.size();
+    for (size_t i = 2; i < n; i++)                    // stretched words (hmmm, sooo) are on purpose
+        if (word[i] == word[i - 1] && word[i] == word[i - 2]) return std::nullopt;
+    std::set<wstring> found, checked;
+    bool stop = false;
+    auto consider = [&](const wstring& c) {
+        if (stop || c == word || !checked.insert(c).second) return;
+        if (GetTickCount64() > deadline) { stop = true; found.clear(); return; }
+        if (g_lexicon.isWord(c, lang)) found.insert(c);
+        if (found.size() > 1) stop = true;            // ambiguous
+    };
+    for (size_t i = 0; i + 1 < n; i++)
+        if (word[i] != word[i + 1]) { wstring c = word; std::swap(c[i], c[i + 1]); consider(c); }
+    if (n >= 5)
+        for (size_t i = 1; i + 1 < n; i++)
+            for (const wchar_t* p = alphabet(lang); *p; p++)
+                if (*p != word[i] && touching(word[i], *p, hkl)) { wstring c = word; c[i] = *p; consider(c); }
+    for (size_t i = 1; i < n; i++)
+        if (word[i] == word[i - 1]) { wstring c = word; c.erase(i, 1); consider(c); }
+    for (size_t i = 0; i < n; i++) { wstring c = word; c.insert(i, 1, word[i]); consider(c); }
+    if (stop || found.size() != 1) return std::nullopt;
+    return *found.begin();
+}
+
+}  // namespace Typos
 
 // ============================================================================================
 // Text field reader: UI Automation on its own thread (the hook thread must never block)
@@ -918,7 +991,10 @@ private:
         bool layoutFix = !(j.enToUk && j.ukToEn);
         wstring why;
         bool translit = config.transliteration && ukrainianReading(j.enText, streak, why).has_value();
-        if (!layoutFix && !translit) {
+        bool typo = config.autocorrect && buffer_.size() >= 4 &&
+                    (Typos::isPlain(j.enText, L"en") || Typos::isPlain(j.ukText, L"uk")) &&
+                    !g_lexicon.isWord(j.enText, L"en") && !g_lexicon.isWord(j.ukText, L"uk");
+        if (!layoutFix && !translit && !typo) {
             if (g_logOn) logLine(L"skip: en '" + j.enText + L"' / uk '" + j.ukText + L"': nothing to fix (en->uk: " +
                                  j.enToUk.value_or(L"") + L"; uk->en: " + j.ukToEn.value_or(L"") + L")");
             return false;
@@ -1019,6 +1095,7 @@ private:
         if (why) {
             // A Latin word that is fine as English may still be transliterated (in context).
             if (inEnglish && config.transliteration && transliterate(f)) return;
+            if (config.autocorrect && fixTypo(inEnglish)) return;
             logLine(L"skip: '" + (inEnglish ? job_.enText : job_.ukText) + L"' is on screen and is fine: " + *why);
             skipWord();
             return;
@@ -1126,6 +1203,52 @@ private:
         // The result has no key equivalent we track: backspacing into it starts fresh.
         history_.clear();
         translitStreak_ = true;
+        buffer_.clear();
+        atWordStart_ = true;
+        finishJob();
+        return true;
+    }
+
+    /// Optional mode: a word that is not a word in either layout but one common slip away from exactly
+    /// one word (implemnet -> implement). Tried on the spelling on screen first, then on the other
+    /// layout's spelling (a typo typed in the wrong layout too).
+    bool fixTypo(bool inEnglish) {
+        if (job_.keys.size() < 4) return false;
+        wstring screen = inEnglish ? job_.enText : job_.ukText, other = inEnglish ? job_.ukText : job_.enText;
+        wstring screenLang = inEnglish ? L"en" : L"uk", otherLang = inEnglish ? L"uk" : L"en";
+        HKL screenHkl = inEnglish ? g_layouts.en : g_layouts.uk, otherHkl = inEnglish ? g_layouts.uk : g_layouts.en;
+        std::set<wstring> exc = exceptions();
+        if (exc.count(lower(screen)) || exc.count(lower(other))) { logLine(L"typo skip: in exceptions"); return false; }
+        if (g_lexicon.isWord(screen, screenLang) || g_lexicon.isWord(other, otherLang)) return false;
+
+        ULONGLONG deadline = GetTickCount64() + 40;     // never hold up typing for long
+        std::optional<wstring> fix;
+        bool otherLayout = false;
+        if (Typos::isPlain(screen, screenLang)) fix = Typos::correction(screen, screenLang, screenHkl, deadline);
+        if (!fix && Typos::isPlain(other, otherLang)) {
+            fix = Typos::correction(other, otherLang, otherHkl, deadline);
+            otherLayout = fix.has_value();
+        }
+        if (!fix) { logLine(L"typo skip: no single word one slip away from '" + screen + L"'"); return false; }
+        if (exc.count(*fix)) { logLine(L"typo skip: '" + *fix + L"' is in exceptions"); return false; }
+        logLine(L"typo: '" + screen + L"' -> '" + *fix + L"' in " + job_.app);
+
+        vector<INPUT> in;
+        for (size_t i = 0; i < screen.size(); i++) addKey(in, VK_BACK);
+        addText(in, *fix + L" ");
+        send(in, 0);
+        if (otherLayout) switchLayout(otherHkl);
+
+        Correction c;
+        c.typedKeys = job_.keys;
+        c.typedText = screen;
+        c.inserted = *fix;
+        c.fromLayout = screenHkl;
+        c.words = {screen};
+        c.time = GetTickCount64();
+        last_ = c;
+        history_.clear();
+        translitStreak_ = false;
         buffer_.clear();
         atWordStart_ = true;
         finishJob();
@@ -1354,7 +1477,7 @@ static void showMenu() {
 // ============================================================================================
 
 enum SettingsId {
-    IDC_ENABLED = 100, IDC_STARTUP, IDC_MIN, IDC_MAX, IDC_UNDO, IDC_LEARN, IDC_TRANSLIT,
+    IDC_ENABLED = 100, IDC_STARTUP, IDC_MIN, IDC_MAX, IDC_UNDO, IDC_LEARN, IDC_TRANSLIT, IDC_TYPOS,
     IDC_EXCEPTIONS, IDC_APPS, IDC_LOG, IDC_SAVE, IDC_CANCEL
 };
 static HWND g_settings = nullptr;
@@ -1386,6 +1509,7 @@ static void fillSettings(HWND w) {
     SendMessageW(undo, CB_SETCURSEL, c.undoKey == L"escape" ? 0 : c.undoKey == L"backspace" ? 1 : 2, 0);
     CheckDlgButton(w, IDC_LEARN, c.learnOnUndo ? BST_CHECKED : BST_UNCHECKED);
     CheckDlgButton(w, IDC_TRANSLIT, c.transliteration ? BST_CHECKED : BST_UNCHECKED);
+    CheckDlgButton(w, IDC_TYPOS, c.autocorrect ? BST_CHECKED : BST_UNCHECKED);
     CheckDlgButton(w, IDC_LOG, c.debugLog ? BST_CHECKED : BST_UNCHECKED);
     wstring words;
     for (const wstring& line : fileLines(g_paths->exceptions)) words += line + L"\r\n";
@@ -1404,6 +1528,7 @@ static void saveSettings(HWND w) {
     c.undoKey = undo == 1 ? L"backspace" : undo == 2 ? L"none" : L"escape";
     c.learnOnUndo = IsDlgButtonChecked(w, IDC_LEARN) == BST_CHECKED;
     c.transliteration = IsDlgButtonChecked(w, IDC_TRANSLIT) == BST_CHECKED;
+    c.autocorrect = IsDlgButtonChecked(w, IDC_TYPOS) == BST_CHECKED;
     c.debugLog = IsDlgButtonChecked(w, IDC_LOG) == BST_CHECKED;
     c.excludedApps.clear();
     wstring apps = windowText(GetDlgItem(w, IDC_APPS));
@@ -1440,7 +1565,8 @@ static LRESULT CALLBACK settingsProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             for (const wchar_t* s : {L"Esc", L"Backspace", L"Off"}) SendMessageW(undo, CB_ADDSTRING, 0, (LPARAM)s);
             y += 32;
             control(w, L"BUTTON", L"Never convert words undone with Esc", BS_AUTOCHECKBOX | WS_TABSTOP, 16, y, 340, 22, IDC_LEARN); y += 26;
-            control(w, L"BUTTON", L"Ukrainian typed in Latin \u2192 Cyrillic (privit \u2192 \u043f\u0440\u0438\u0432\u0456\u0442)", BS_AUTOCHECKBOX | WS_TABSTOP, 16, y, 360, 22, IDC_TRANSLIT); y += 34;
+            control(w, L"BUTTON", L"Ukrainian typed in Latin \u2192 Cyrillic (privit \u2192 \u043f\u0440\u0438\u0432\u0456\u0442)", BS_AUTOCHECKBOX | WS_TABSTOP, 16, y, 360, 22, IDC_TRANSLIT); y += 26;
+            control(w, L"BUTTON", L"Fix typos (one letter off: implemnet \u2192 implement)", BS_AUTOCHECKBOX | WS_TABSTOP, 16, y, 360, 22, IDC_TYPOS); y += 34;
             control(w, L"STATIC", L"Never convert (one word per line, either layout)", 0, 16, y, 340, 20, 0); y += 22;
             control(w, L"EDIT", L"", ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL | ES_WANTRETURN | WS_TABSTOP, 16, y, 340, 80, IDC_EXCEPTIONS); y += 92;
             control(w, L"STATIC", L"Ignored apps (program names, comma separated)", 0, 16, y, 340, 20, 0); y += 22;
@@ -1473,7 +1599,7 @@ static void showSettings() {
         SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof m, &m, 0);
         g_font = CreateFontIndirectW(&m.lfMessageFont);
     }
-    RECT r{0, 0, dpiScale(376), dpiScale(540)};
+    RECT r{0, 0, dpiScale(376), dpiScale(566)};
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
     AdjustWindowRect(&r, style, FALSE);
     int w = r.right - r.left, h = r.bottom - r.top;

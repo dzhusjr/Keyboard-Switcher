@@ -79,6 +79,7 @@ struct Config {
     var excludedApps: Set<String> = ["com.apple.Terminal", "com.googlecode.iterm2"]
     var debugLog = false
     var transliteration = false
+    var autocorrect = false
     var englishLayout = "auto"
     var ukrainianLayout = "auto"
     var exceptions = Set<String>()
@@ -108,6 +109,7 @@ struct Config {
             case "menu_bar_icon": s.menuBarIcon = flag
             case "debug_log": s.debugLog = flag
             case "transliteration": s.transliteration = flag
+            case "autocorrect": s.autocorrect = flag
             case "english_layout": s.englishLayout = value
             case "ukrainian_layout": s.ukrainianLayout = value
             case "excluded_apps":
@@ -138,6 +140,7 @@ struct Config {
         ukrainian_layout = \(ukrainianLayout)
         debug_log = \(debugLog)
         transliteration = \(transliteration)
+        autocorrect = \(autocorrect)
 
         """
         try? FileManager.default.createDirectory(at: Files.dir, withIntermediateDirectories: true)
@@ -285,6 +288,84 @@ enum Translit {
         }
         walk(0, "")
         return found
+    }
+}
+
+// MARK: - Typos (optional): one letter off
+
+enum Typos {
+    static let alphabet: [String: [Character]] = [
+        "en": Array("abcdefghijklmnopqrstuvwxyz"),
+        "uk": Array("абвгґдеєжзиіїйклмнопрстуфхцчшщьюя'"),
+    ]
+
+    /// Physical key positions (row, column) by macOS virtual key code (letter rows, ANSI).
+    static let grid: [UInt16: (row: Int, col: Int)] = {
+        let rows: [[UInt16]] = [[12, 13, 14, 15, 17, 16, 32, 34, 31, 35, 33, 30],
+                                [0, 1, 2, 3, 5, 4, 38, 40, 37, 41, 39],
+                                [6, 7, 8, 9, 11, 45, 46, 43, 47, 44]]
+        var g: [UInt16: (row: Int, col: Int)] = [:]
+        for (r, row) in rows.enumerated() { for (c, k) in row.enumerated() { g[k] = (r, c) } }
+        return g
+    }()
+
+    /// Keys that touch on a staggered keyboard: left/right, two above, two below.
+    static func adjacent(_ a: (row: Int, col: Int), _ b: (row: Int, col: Int)) -> Bool {
+        switch b.row - a.row {
+        case 0: return abs(b.col - a.col) == 1
+        case -1: return b.col == a.col || b.col == a.col + 1
+        case 1: return b.col == a.col || b.col == a.col - 1
+        default: return false
+        }
+    }
+
+    static func isPlain(_ w: String, _ lang: String) -> Bool {
+        guard let letters = alphabet[lang], !w.isEmpty, w == w.lowercased() else { return false }
+        return w.allSatisfy { letters.contains($0) } && w.first != "'" && w.last != "'"
+    }
+
+    /// The one word that `word` becomes by undoing a single common slip, or nil if there is none or
+    /// more than one. Only these slips are considered, because they are what fingers actually do and
+    /// they rarely turn one valid word into another:
+    ///   - two neighbouring letters swapped          implemnet → implement
+    ///   - a key right next to the intended one      hwllo → hello   (inside words of 5+ letters)
+    ///   - a letter doubled by accident              helllo → hello
+    ///   - a double letter typed once                adress → address
+    /// (Arbitrary missing or extra letters are not: iphone would become phone.)
+    static func correction(of word: String, lang: String, near: (Character, Character) -> Bool,
+                           isWord: (String) -> Bool, deadline: Date) -> String? {
+        guard let letters = alphabet[lang] else { return nil }
+        let w = Array(word), n = w.count
+        // Stretched words (hmmm, sooo, ахааа) are written that way on purpose.
+        for i in 2 ..< n where w[i] == w[i - 1] && w[i] == w[i - 2] { return nil }
+        var found = Set<String>()
+        var checked = Set<String>()
+        func consider(_ c: [Character]) -> Bool {
+            let s = String(c)
+            guard s != word, checked.insert(s).inserted else { return true }
+            if Date() > deadline { return false }
+            if isWord(s) { found.insert(s) }
+            return found.count < 2                                   // a second hit: ambiguous, stop
+        }
+        for i in 0 ..< n - 1 where w[i] != w[i + 1] {
+            var c = w; c.swapAt(i, i + 1); if !consider(c) { return nil }
+        }
+        // Neighbouring-key slips only inside words of 5+ letters: an unknown short word, or a first or
+        // last letter (slang, names, Ukrainian endings), too easily turns into some other real word.
+        if n >= 5 {
+            for i in 1 ..< n - 1 {
+                for ch in letters where ch != w[i] && near(w[i], ch) {
+                    var c = w; c[i] = ch; if !consider(c) { return nil }
+                }
+            }
+        }
+        for i in 1 ..< n where w[i] == w[i - 1] {
+            var c = w; c.remove(at: i); if !consider(c) { return nil }
+        }
+        for i in 0 ..< n {
+            var c = w; c.insert(w[i], at: i); if !consider(c) { return nil }
+        }
+        return found.count == 1 ? found.first : nil
     }
 }
 
@@ -820,6 +901,7 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                         minLength: settings.minLength, exceptions: exceptions, isWord: lexicon.isWord)
         if let a = enToUk, let b = ukToEn {
             if settings.transliteration, transliterate(enChars, appID, streak: streak, proxy) { return true }
+            if settings.autocorrect, fixTypo(enChars, ukChars, appID, proxy) { return true }
             return skip("en '\(enText)' / uk '\(ukText)': nothing to fix (en→uk: \(a); uk→en: \(b))")
         }
 
@@ -1001,6 +1083,66 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         if allMapped, let lastWord = wordKeys.last { pushWord(lastWord, changed: true) } else { history.removeAll() }
         translitStreak = true
+        buffer.removeAll()
+        atWordStart = true
+        return true
+    }
+
+    /// Optional mode: a word that is not a word in either layout, but one letter away from exactly
+    /// one word (implemnet → implement, привіи → привіт). Tried on the spelling on screen first, then
+    /// on the other layout's spelling (a typo typed in the wrong layout too). Only plain lowercase
+    /// words of 4+ letters, only in fields whose text can be read; ambiguous cases are left alone.
+    private func fixTypo(_ enChars: [String], _ ukChars: [String], _ appID: String, _ proxy: CGEventTapProxy) -> Bool {
+        func skip(_ why: String) -> Bool { DebugLog.write("typo skip: \(why)"); return false }
+        guard buffer.count >= 4, let en = layouts.english, let uk = layouts.ukrainian else { return false }
+        let enText = enChars.joined(), ukText = ukChars.joined()
+        let enPlain = Typos.isPlain(enText, "en"), ukPlain = Typos.isPlain(ukText, "uk")
+        guard enPlain || ukPlain else { return skip("'\(enText)' / '\(ukText)' is not a plain lowercase word") }
+        let exceptions = settings.exceptions.union(sessionIgnore)
+        guard !exceptions.contains(enText), !exceptions.contains(ukText) else { return skip("in exceptions") }
+        // Never touch a real word: only words that are words in neither layout.
+        guard !lexicon.isWord(enText, "en"), !lexicon.isWord(ukText, "uk") else { return false }
+
+        let field = FocusedField.check(candidates: [enText, ukText])
+        guard field == .verified else { return skip("field check: \(field) in \(appID)") }
+        let onScreenEnglish = FocusedField.matched == 0
+        typealias Side = (text: String, lang: String, layout: KeyLayout, plain: Bool, chars: [String])
+        let enSide: Side = (enText, "en", en, enPlain, enChars), ukSide: Side = (ukText, "uk", uk, ukPlain, ukChars)
+        let screen = onScreenEnglish ? enSide : ukSide, other = onScreenEnglish ? ukSide : enSide
+
+        let deadline = Date().addingTimeInterval(0.04)       // never hold up typing for long
+        func search(_ side: Side) -> String? {
+            guard side.plain else { return nil }
+            return Typos.correction(of: side.text, lang: side.lang, near: { a, b in
+                guard let ka = side.layout.keyFor[String(a)], let kb = side.layout.keyFor[String(b)],
+                      let pa = Typos.grid[ka.code], let pb = Typos.grid[kb.code] else { return false }
+                return Typos.adjacent(pa, pb)
+            }, isWord: { self.lexicon.isWord($0, side.lang) }, deadline: deadline)
+        }
+        var target = screen
+        var fix = search(screen)
+        if fix == nil, let f = search(other) { fix = f; target = other }   // wrong layout and a typo
+        guard let fixed = fix else { return skip("no single word one letter away from '\(screen.text)'") }
+        guard !exceptions.contains(fixed) else { return skip("'\(fixed)' is in exceptions") }
+        DebugLog.write("typo: '\(screen.text)' → '\(fixed)' in \(appID)")
+
+        for _ in buffer { post(UInt16(kVK_Delete), nil, shift: false, proxy) }
+        var newKeys: [Key] = []
+        for ch in fixed.map(String.init) {
+            if let k = target.layout.keyFor[ch] {
+                post(k.code, ch, shift: k.shift, proxy)
+                newKeys.append(Key(code: k.code, shift: k.shift, caps: false, char: ch))
+            } else {
+                post(0, ch, shift: false, proxy)
+            }
+        }
+        post(UInt16(kVK_Space), " ", shift: false, proxy)
+        if target.lang != screen.lang { selectLayout(target.layout.source) }
+
+        let typedKeys = zip(buffer, screen.chars).map { Key(code: $0.code, shift: $0.shift, caps: $0.caps, char: $1) }
+        last = Correction(typed: typedKeys, inserted: fixed, from: screen.layout.source, words: [screen.text], time: Date())
+        if newKeys.count == fixed.count { pushWord(newKeys, changed: true) } else { history.removeAll() }
+        translitStreak = false
         buffer.removeAll()
         atWordStart = true
         return true
@@ -1231,6 +1373,7 @@ struct SettingsView: View {
                 }
                 Toggle("Never convert words undone with Esc", isOn: $model.config.learnOnUndo)
                 Toggle("Ukrainian typed in Latin → Cyrillic (privit → привіт)", isOn: $model.config.transliteration)
+                Toggle("Fix typos (one letter off: implemnet → implement)", isOn: $model.config.autocorrect)
             }
             Section {
                 TextEditor(text: $model.exceptions)
