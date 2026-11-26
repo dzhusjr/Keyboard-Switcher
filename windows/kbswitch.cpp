@@ -31,6 +31,7 @@
 #include <uiautomation.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
@@ -39,10 +40,12 @@
 #include <memory>
 #include <optional>
 #include <set>
+#include <tuple>
 #include <string>
 #include <vector>
 
 #include "hunspell.h"
+#include "kbcorrect.h"
 #include "resource.h"
 
 using std::wstring;
@@ -175,7 +178,7 @@ struct Config {
     wstring undoKey = L"escape";               // escape | backspace | none
     bool learnOnUndo = true;
     bool transliteration = false;
-    bool autocorrect = false;
+    wstring typoFixing = L"off";               // off | careful | smart
     bool debugLog = false;
     std::set<wstring> excludedApps = {L"cmd.exe", L"powershell.exe", L"pwsh.exe", L"windowsterminal.exe", L"conhost.exe"};
     std::set<wstring> exceptions;              // lowercase
@@ -199,7 +202,8 @@ struct Config {
             else if (key == L"undo_key") { wstring l = lower(v); c.undoKey = (l == L"none" || l == L"backspace") ? l : L"escape"; }
             else if (key == L"learn_on_undo") c.learnOnUndo = flag(v);
             else if (key == L"transliteration") c.transliteration = flag(v);
-            else if (key == L"autocorrect") c.autocorrect = flag(v);
+            else if (key == L"autocorrect") { if (flag(v) && c.typoFixing == L"off") c.typoFixing = L"careful"; }   // older setting
+            else if (key == L"typo_fixing") { wstring l = lower(v); if (l == L"off" || l == L"careful" || l == L"smart") c.typoFixing = l; }
             else if (key == L"debug_log") c.debugLog = flag(v);
             else if (key == L"excluded_apps") {
                 c.excludedApps.clear();
@@ -228,7 +232,7 @@ struct Config {
         t += L"undo_key = " + undoKey + L"\r\n";
         t += L"learn_on_undo = " + wstring(learnOnUndo ? L"true" : L"false") + L"\r\n";
         t += L"transliteration = " + wstring(transliteration ? L"true" : L"false") + L"\r\n";
-        t += L"autocorrect = " + wstring(autocorrect ? L"true" : L"false") + L"\r\n";
+        t += L"typo_fixing = " + typoFixing + L"\r\n";
         t += L"debug_log = " + wstring(debugLog ? L"true" : L"false") + L"\r\n";
         t += L"excluded_apps = " + apps + L"\r\n";
         writeFile(g_paths->settings, t);
@@ -531,6 +535,65 @@ static std::optional<wstring> correction(const wstring& word, const wstring& lan
 }  // namespace Typos
 
 // ============================================================================================
+// Smart typo fixing: the shared C++ engine (../engine) with the language models (dict\*.kbm),
+// loaded on a background thread so starting stays instant.
+// ============================================================================================
+
+struct Smart {
+    KBModel* en = nullptr;
+    KBModel* uk = nullptr;
+    std::atomic<bool> loaded{false};
+    bool started = false;
+
+    bool ready() const { return loaded.load(); }
+
+    void start(const std::set<wstring>& learned) {
+        if (started) { learn(learned); return; }
+        started = true;
+        auto* words = new vector<wstring>(learned.begin(), learned.end());
+        CreateThread(nullptr, 0, &Smart::loadThread, words, 0, nullptr);
+    }
+
+    void learn(const std::set<wstring>& words) {
+        if (!ready()) return;
+        for (const wstring& w : words) { kb_learn(en, utf8(w).c_str()); kb_learn(uk, utf8(w).c_str()); }
+    }
+
+    std::optional<wstring> correct(const wstring& word, const wstring& lang,
+                                   const std::optional<wstring>& prev, const std::optional<wstring>& next) {
+        KBModel* m = lang == L"en" ? en : uk;
+        if (!ready() || !m) return std::nullopt;
+        std::string p = prev ? utf8(*prev) : std::string(), n = next ? utf8(*next) : std::string();
+        char out[256];
+        if (kb_correct(m, utf8(word).c_str(), prev ? p.c_str() : nullptr, next ? n.c_str() : nullptr, 0, out, sizeof out, nullptr))
+            return wide(out);
+        return std::nullopt;
+    }
+
+    static DWORD WINAPI loadThread(LPVOID param);
+};
+static Smart g_smart;
+
+DWORD WINAPI Smart::loadThread(LPVOID param) {
+    std::unique_ptr<vector<wstring>> learned(static_cast<vector<wstring>*>(param));
+    wstring dir = exeDir() + L"\\dict\\";
+    KBModel* e = kb_load_w((dir + L"en.kbm").c_str());
+    KBModel* u = kb_load_w((dir + L"uk.kbm").c_str());
+    for (auto [m, lang, hkl] : {std::make_tuple(e, wstring(L"en"), g_layouts.en), std::make_tuple(u, wstring(L"uk"), g_layouts.uk)}) {
+        if (!m) continue;
+        for (const wchar_t* p = Typos::alphabet(lang); *p; p++) {
+            int row, col;
+            if (*p != L'\'' && Typos::position(*p, hkl, row, col)) kb_set_key(m, (unsigned)*p, row, col);
+        }
+        for (const wstring& w : *learned) kb_learn(m, utf8(w).c_str());
+    }
+    g_smart.en = e;
+    g_smart.uk = u;
+    if (e && u) g_smart.loaded = true;
+    return 0;
+}
+
+// ============================================================================================
 // Text field reader: UI Automation on its own thread (the hook thread must never block)
 // ============================================================================================
 
@@ -713,6 +776,7 @@ struct Job {
     wstring app;
     Correction undo;
     bool learn = false;
+    bool tooShort = false;     // only checked to give the previous word context
     WORD heldKey = VK_SPACE;   // the key we swallowed to start the job
 };
 
@@ -723,6 +787,7 @@ public:
 
     void reloadConfig() {
         config = Config::load();
+        if (config.typoFixing == L"smart") g_smart.start(config.exceptions);
         bool wasLogging = g_logOn;
         g_logOn = config.debugLog;
         if (g_logOn && !wasLogging) writeLogHeader();
@@ -859,6 +924,7 @@ private:
     Job job_;
     int nextJob_ = 1;
     vector<INPUT> held_;
+    vector<INPUT> pending_;          // an edit to the previous word, sent together with this word's
     bool dropKeyUp_ = false;
     DWORD dropKeyUpVk_ = 0;
     std::map<DWORD, wstring> appNames_;
@@ -974,7 +1040,10 @@ private:
         bool streak = translitStreak_;
         translitStreak_ = false;
         int shortest = config.transliteration ? 1 : config.minLength;
-        if ((int)buffer_.size() < shortest || (int)buffer_.size() > config.maxLength) return false;
+        if ((int)buffer_.size() > config.maxLength) return false;
+        bool tooShort = (int)buffer_.size() < shortest;
+        // A short word can still give the word before it the context it needs (Smart mode).
+        if (tooShort && !(config.typoFixing == L"smart" && g_smart.ready() && previousWorthChecking())) return false;
         if (!g_layouts.en || !g_layouts.uk) { logLine(L"skip: need both an English and a Ukrainian layout"); return false; }
         if (!g_lexicon.en.ok() || !g_lexicon.uk.ok()) { logLine(L"skip: dictionaries missing next to the exe (dict\\)"); return false; }
 
@@ -991,10 +1060,11 @@ private:
         bool layoutFix = !(j.enToUk && j.ukToEn);
         wstring why;
         bool translit = config.transliteration && ukrainianReading(j.enText, streak, why).has_value();
-        bool typo = config.autocorrect && buffer_.size() >= 4 &&
+        bool smart = config.typoFixing == L"smart" && g_smart.ready();
+        bool typo = ((config.typoFixing == L"careful" && buffer_.size() >= 4) || (smart && buffer_.size() >= 3)) &&
                     (Typos::isPlain(j.enText, L"en") || Typos::isPlain(j.ukText, L"uk")) &&
                     !g_lexicon.isWord(j.enText, L"en") && !g_lexicon.isWord(j.ukText, L"uk");
-        if (!layoutFix && !translit && !typo) {
+        if (!layoutFix && !translit && !typo && !(smart && previousWorthChecking())) {
             if (g_logOn) logLine(L"skip: en '" + j.enText + L"' / uk '" + j.ukText + L"': nothing to fix (en->uk: " +
                                  j.enToUk.value_or(L"") + L"; uk->en: " + j.ukToEn.value_or(L"") + L")");
             return false;
@@ -1006,6 +1076,7 @@ private:
 
         j.kind = Job::Word;
         j.heldKey = VK_SPACE;
+        j.tooShort = tooShort;
         begin(j, {j.enText, j.ukText});
         return true;
     }
@@ -1062,6 +1133,8 @@ private:
 
     /// One SendInput call: the edit, the swallowed key (if any), then everything typed meanwhile.
     void send(vector<INPUT> in, WORD swallowedKey) {
+        in.insert(in.begin(), pending_.begin(), pending_.end());
+        pending_.clear();
         if (swallowedKey) addKey(in, swallowedKey);
         in.insert(in.end(), held_.begin(), held_.end());
         held_.clear();
@@ -1090,12 +1163,15 @@ private:
         if (f.state != FieldState::Readable) { logLine(wstring(L"skip: ") + stateName(f.state) + L" in " + job_.app); skipWord(); return; }
         bool inEnglish = fieldShows(f, job_.enText), inUkrainian = fieldShows(f, job_.ukText);
         if (!inEnglish && !inUkrainian) { logLine(L"skip: the field doesn't show the typed word"); skipWord(); return; }
+        if (config.typoFixing == L"smart") fixPreviousWord(f);
+        if (job_.tooShort) { skipWord(); return; }
 
         const std::optional<wstring>& why = inEnglish ? job_.enToUk : job_.ukToEn;
         if (why) {
             // A Latin word that is fine as English may still be transliterated (in context).
             if (inEnglish && config.transliteration && transliterate(f)) return;
-            if (config.autocorrect && fixTypo(inEnglish)) return;
+            if (config.typoFixing == L"careful" && fixTypo(inEnglish)) return;
+            if (config.typoFixing == L"smart" && smartFix(inEnglish)) return;
             logLine(L"skip: '" + (inEnglish ? job_.enText : job_.ukText) + L"' is on screen and is fine: " + *why);
             skipWord();
             return;
@@ -1232,7 +1308,15 @@ private:
         if (!fix) { logLine(L"typo skip: no single word one slip away from '" + screen + L"'"); return false; }
         if (exc.count(*fix)) { logLine(L"typo skip: '" + *fix + L"' is in exceptions"); return false; }
         logLine(L"typo: '" + screen + L"' -> '" + *fix + L"' in " + job_.app);
+        replaceWord(screen, screenHkl, *fix, otherLayout ? otherHkl : nullptr);
+        return true;
+    }
 
+    /// Deletes the word on screen and types `fixed`; switches to `switchTo` if given.
+    void replaceWord(const wstring& screen, HKL screenHkl, const wstring& fixed, HKL switchTo) {
+        const wstring* fix = &fixed;
+        bool otherLayout = switchTo != nullptr;
+        HKL otherHkl = switchTo;
         vector<INPUT> in;
         for (size_t i = 0; i < screen.size(); i++) addKey(in, VK_BACK);
         addText(in, *fix + L" ");
@@ -1252,7 +1336,90 @@ private:
         buffer_.clear();
         atWordStart_ = true;
         finishJob();
+    }
+
+    /// The word `back` places before the current one, spelled in a layout, if it's a plain word.
+    std::optional<wstring> earlierWord(size_t back, bool english) const {
+        if (history_.size() < back) return std::nullopt;
+        const Entry& e = history_[history_.size() - back];
+        wstring w;
+        if (e.keys.empty() || !Layouts::spell(e.keys, english ? g_layouts.en : g_layouts.uk, w)) return std::nullopt;
+        w = lower(w);
+        if (!Typos::isPlain(w, english ? L"en" : L"uk")) return std::nullopt;
+        return w;
+    }
+
+    /// Cheap test (in the hook): is the previous word one Smart mode could revisit?
+    bool previousWorthChecking() const {
+        if (history_.empty() || history_.back().changed || history_.back().keys.empty()) return false;
+        wstring pEn, pUk;
+        if (!Layouts::spell(history_.back().keys, g_layouts.en, pEn) || !Layouts::spell(history_.back().keys, g_layouts.uk, pUk)) return false;
+        std::set<wstring> exc = exceptions();
+        return (Typos::isPlain(pEn, L"en") || Typos::isPlain(pUk, L"uk")) && !g_lexicon.isWord(pEn, L"en") &&
+               !g_lexicon.isWord(pUk, L"uk") && !exc.count(lower(pEn)) && !exc.count(lower(pUk));
+    }
+
+    /// Smart mode: a non-word the language model picks the most likely word for, using the word
+    /// before it, frequencies (including slang) and a keyboard-aware typing model; tried on the
+    /// spelling on screen, then on the other layout's (wrong layout and a typo).
+    bool smartFix(bool inEnglish) {
+        if (!g_smart.ready() || job_.keys.size() < 3) return false;
+        wstring screen = inEnglish ? job_.enText : job_.ukText, other = inEnglish ? job_.ukText : job_.enText;
+        wstring screenLang = inEnglish ? L"en" : L"uk", otherLang = inEnglish ? L"uk" : L"en";
+        HKL screenHkl = inEnglish ? g_layouts.en : g_layouts.uk, otherHkl = inEnglish ? g_layouts.uk : g_layouts.en;
+        std::set<wstring> exc = exceptions();
+        if (exc.count(lower(screen)) || exc.count(lower(other))) return false;
+        if (g_lexicon.isWord(screen, screenLang) || g_lexicon.isWord(other, otherLang)) return false;
+        std::optional<wstring> fix;
+        bool otherLayout = false;
+        if (Typos::isPlain(screen, screenLang)) fix = g_smart.correct(screen, screenLang, earlierWord(1, inEnglish), std::nullopt);
+        if (!fix && Typos::isPlain(other, otherLang)) {
+            fix = g_smart.correct(other, otherLang, earlierWord(1, !inEnglish), std::nullopt);
+            otherLayout = fix.has_value();
+        }
+        if (!fix || exc.count(*fix)) { logLine(L"smart skip: no confident correction for '" + screen + L"'"); return false; }
+        logLine(L"smart: '" + screen + L"' -> '" + *fix + L"' in " + job_.app);
+        replaceWord(screen, screenHkl, *fix, otherLayout ? otherHkl : nullptr);
         return true;
+    }
+
+    /// Smart mode, on Space: the previous word (left unchanged, a word in neither layout) is checked
+    /// again now that the word after it is known. The field must show exactly "previous + this word".
+    /// The edit is queued and sent together with whatever happens to this word.
+    void fixPreviousWord(const FieldRead& f) {
+        if (!g_smart.ready() || !previousWorthChecking()) return;
+        const Entry prev = history_.back();
+        wstring pEn, pUk;
+        Layouts::spell(prev.keys, g_layouts.en, pEn);
+        Layouts::spell(prev.keys, g_layouts.uk, pUk);
+        struct Combo { wstring p, c; bool prevEnglish; };
+        const Combo combos[] = {{pEn, job_.enText, true}, {pUk, job_.ukText, false}, {pEn, job_.ukText, true}, {pUk, job_.enText, false}};
+        for (const Combo& c : combos) {
+            if (!fieldShows(f, c.p + L" " + c.c)) continue;
+            wstring lang = c.prevEnglish ? L"en" : L"uk";
+            if (!Typos::isPlain(c.p, lang)) return;
+            wstring meant = lower(c.prevEnglish ? job_.enText : job_.ukText);   // this word, as meant in that language
+            std::optional<wstring> next;
+            if (Typos::isPlain(meant, lang)) next = meant;
+            std::optional<wstring> fixed = g_smart.correct(c.p, lang, earlierWord(2, c.prevEnglish), next);
+            if (!fixed || exceptions().count(*fixed)) return;
+            logLine(L"smart (with the next word): '" + c.p + L" " + c.c + L"' -> '" + *fixed + L" " + c.c + L"'");
+            for (size_t i = 0; i < c.c.size() + 1 + c.p.size(); i++) addKey(pending_, VK_BACK);
+            addText(pending_, *fixed + L" " + c.c);
+            history_.pop_back();
+            history_.push_back({{}, true});      // typed as text: no key equivalent to return to
+            Correction cc;
+            cc.typedKeys = prev.keys;
+            cc.typedKeys.push_back(Key{VK_SPACE, 0, false, false});
+            cc.typedKeys.insert(cc.typedKeys.end(), job_.keys.begin(), job_.keys.end());
+            cc.typedText = c.p + L" " + c.c;
+            cc.inserted = *fixed + L" " + c.c;
+            cc.fromLayout = c.prevEnglish ? g_layouts.en : g_layouts.uk;
+            cc.words = {c.p};
+            cc.time = GetTickCount64();
+            last_ = cc;
+            return;
+        }
     }
 
     void finishUndo(const FieldRead& f) {
@@ -1270,6 +1437,7 @@ private:
         addText(in, c.typedText + L" ");
         send(in, 0);
         switchLayout(c.fromLayout);
+        g_smart.learn(std::set<wstring>(c.words.begin(), c.words.end()));
         for (const wstring& w : c.words) {
             sessionIgnore_.insert(lower(w));
             // Backspace is also plain editing, so only an Esc undo is remembered for good.
@@ -1389,7 +1557,7 @@ static bool selfInstall() {
     DWORD n = GetModuleFileNameW(nullptr, self, MAX_PATH * 2);
     wstring exe = dir + L"\\KBSwitch.exe";
     bool ok = CopyFileW(wstring(self, n).c_str(), exe.c_str(), FALSE) != 0;
-    for (const wchar_t* f : {L"en_US.aff", L"en_US.dic", L"uk_UA.aff", L"uk_UA.dic"})
+    for (const wchar_t* f : {L"en_US.aff", L"en_US.dic", L"uk_UA.aff", L"uk_UA.dic", L"en.kbm", L"uk.kbm"})
         ok = CopyFileW((dictFrom + L"\\" + f).c_str(), (dictTo + L"\\" + f).c_str(), FALSE) && ok;
     if (!ok) {
         MessageBoxW(nullptr, (L"KBSwitch couldn't be installed into\n" + dir + L"\nIt will run from its current folder instead.").c_str(),
@@ -1509,7 +1677,7 @@ static void fillSettings(HWND w) {
     SendMessageW(undo, CB_SETCURSEL, c.undoKey == L"escape" ? 0 : c.undoKey == L"backspace" ? 1 : 2, 0);
     CheckDlgButton(w, IDC_LEARN, c.learnOnUndo ? BST_CHECKED : BST_UNCHECKED);
     CheckDlgButton(w, IDC_TRANSLIT, c.transliteration ? BST_CHECKED : BST_UNCHECKED);
-    CheckDlgButton(w, IDC_TYPOS, c.autocorrect ? BST_CHECKED : BST_UNCHECKED);
+    SendMessageW(GetDlgItem(w, IDC_TYPOS), CB_SETCURSEL, c.typoFixing == L"smart" ? 2 : c.typoFixing == L"careful" ? 1 : 0, 0);
     CheckDlgButton(w, IDC_LOG, c.debugLog ? BST_CHECKED : BST_UNCHECKED);
     wstring words;
     for (const wstring& line : fileLines(g_paths->exceptions)) words += line + L"\r\n";
@@ -1528,7 +1696,8 @@ static void saveSettings(HWND w) {
     c.undoKey = undo == 1 ? L"backspace" : undo == 2 ? L"none" : L"escape";
     c.learnOnUndo = IsDlgButtonChecked(w, IDC_LEARN) == BST_CHECKED;
     c.transliteration = IsDlgButtonChecked(w, IDC_TRANSLIT) == BST_CHECKED;
-    c.autocorrect = IsDlgButtonChecked(w, IDC_TYPOS) == BST_CHECKED;
+    int typos = (int)SendMessageW(GetDlgItem(w, IDC_TYPOS), CB_GETCURSEL, 0, 0);
+    c.typoFixing = typos == 2 ? L"smart" : typos == 1 ? L"careful" : L"off";
     c.debugLog = IsDlgButtonChecked(w, IDC_LOG) == BST_CHECKED;
     c.excludedApps.clear();
     wstring apps = windowText(GetDlgItem(w, IDC_APPS));
@@ -1566,7 +1735,10 @@ static LRESULT CALLBACK settingsProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             y += 32;
             control(w, L"BUTTON", L"Never convert words undone with Esc", BS_AUTOCHECKBOX | WS_TABSTOP, 16, y, 340, 22, IDC_LEARN); y += 26;
             control(w, L"BUTTON", L"Ukrainian typed in Latin \u2192 Cyrillic (privit \u2192 \u043f\u0440\u0438\u0432\u0456\u0442)", BS_AUTOCHECKBOX | WS_TABSTOP, 16, y, 360, 22, IDC_TRANSLIT); y += 26;
-            control(w, L"BUTTON", L"Fix typos (one letter off: implemnet \u2192 implement)", BS_AUTOCHECKBOX | WS_TABSTOP, 16, y, 360, 22, IDC_TYPOS); y += 34;
+            control(w, L"STATIC", L"Fix typos", 0, 16, y + 3, 120, 20, 0);
+            HWND typos = control(w, L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP, 136, y, 220, 200, IDC_TYPOS);
+            for (const wchar_t* t : {L"Off", L"Careful: one slip", L"Smart: context, slang, mangled words"}) SendMessageW(typos, CB_ADDSTRING, 0, (LPARAM)t);
+            y += 36;
             control(w, L"STATIC", L"Never convert (one word per line, either layout)", 0, 16, y, 340, 20, 0); y += 22;
             control(w, L"EDIT", L"", ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL | ES_WANTRETURN | WS_TABSTOP, 16, y, 340, 80, IDC_EXCEPTIONS); y += 92;
             control(w, L"STATIC", L"Ignored apps (program names, comma separated)", 0, 16, y, 340, 20, 0); y += 22;
@@ -1599,7 +1771,7 @@ static void showSettings() {
         SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof m, &m, 0);
         g_font = CreateFontIndirectW(&m.lfMessageFont);
     }
-    RECT r{0, 0, dpiScale(376), dpiScale(566)};
+    RECT r{0, 0, dpiScale(376), dpiScale(576)};
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
     AdjustWindowRect(&r, style, FALSE);
     int w = r.right - r.left, h = r.bottom - r.top;

@@ -118,14 +118,14 @@ undo key reverts it. Off by default.
 
 **Optional: fix typos.** *Fix typos* has three settings: **Off** (default), **Careful** and **Smart**.
 
-*Smart* (macOS for now) uses an offline language model of English and Ukrainian (word frequencies,
+*Smart* uses an offline language model of English and Ukrainian (word frequencies,
 slang included, and which words follow which; see [model/SOURCES.md](model/SOURCES.md)) plus a
 model of how people mistype on a keyboard. It fixes badly mangled words using the word before
 (`ckasroom` → **classroom**, `зроблю тобы` → **зроблю тобі**), and when the next word arrives it
 looks again at a previous word it left alone, now with context on both sides. It never changes a
 word that is in the dictionary or one you write often (slang such as `норм`, `кринж` or `lol` stays),
-and it only corrects when one answer is clearly ahead. On test text it fixed 78% of English typos with
-1.4% wrong fixes and changed 0.1–0.4% of correctly spelled words. A check takes about 0.4 ms and
+and it only corrects when one answer is clearly ahead. On test text it fixed 81% of English typos with
+1.7% wrong fixes and changed 0.1–0.4% of correctly spelled words. A check takes about 0.4 ms and
 the data uses about 20 MB of memory, loaded only when Smart is on. Words in *Never convert* and words
 whose correction you undo are learned.
 

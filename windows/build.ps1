@@ -22,6 +22,8 @@ cmake -S . -B build -A x64 | Out-Host
 cmake --build build --config Release | Out-Host
 Copy-Item build\Release\KBSwitch.exe $out -Force
 Copy-Item ..\hunspell\LICENSE.MPL "$out\LICENSE-hunspell.txt" -Force
+Copy-Item ..\model\en.kbm, ..\model\uk.kbm "$out\dict" -Force   # language data for Smart typo fixing
+Copy-Item ..\model\SOURCES.md "$out\LANGUAGE-DATA.md" -Force
 
 Compress-Archive -Force -Path $out -DestinationPath dist\KBSwitch-Windows.zip
 Write-Host "Done: windows\dist\KBSwitch-Windows.zip  (unzip anywhere and run KBSwitch.exe: it installs itself)"

@@ -8,8 +8,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(HUNSPELL_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../hunspell)
 file(GLOB HUNSPELL_SOURCES ${HUNSPELL_DIR}/*.cxx)
 
-add_executable(KBSwitch WIN32 kbswitch.cpp kbswitch.rc ${HUNSPELL_SOURCES})
-target_include_directories(KBSwitch PRIVATE ${HUNSPELL_DIR})
+set(ENGINE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../engine)   # Smart typo fixing, shared with macOS
+
+add_executable(KBSwitch WIN32 kbswitch.cpp kbswitch.rc ${HUNSPELL_SOURCES} ${ENGINE_DIR}/kbcorrect.cpp)
+target_include_directories(KBSwitch PRIVATE ${HUNSPELL_DIR} ${ENGINE_DIR})
 target_compile_definitions(KBSwitch PRIVATE HUNSPELL_STATIC UNICODE _UNICODE)
 target_link_libraries(KBSwitch PRIVATE ole32 oleaut32 uuid comctl32 shell32 advapi32 user32 gdi32)
 

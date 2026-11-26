@@ -3,6 +3,12 @@
 #include "kbcorrect.h"
 
 #include <algorithm>
+#ifndef KB_E3
+#define KB_E3 99
+#endif
+#ifndef KB_E2
+#define KB_E2 9
+#endif
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -17,7 +23,10 @@ using u32 = std::u32string;
 
 // ---- tuning (log-probability units; see tools/eval_engine for how these were chosen) --------------
 
-const double kUnknownWord   = -19.0;  // log P of a word that isn't in the vocabulary
+#ifndef KB_UNK
+#define KB_UNK -19.0
+#endif
+const double kUnknownWord   = KB_UNK;  // log P of a word that isn't in the vocabulary
 const double kBackoff       = -0.9;   // stupid backoff when a word pair was never seen
 const double kRightWeight   = 0.7;    // how much the next word counts
 #ifndef KB_MARGIN
@@ -29,10 +38,20 @@ const double kRightWeight   = 0.7;    // how much the next word counts
 const double kNonWordMargin = KB_MARGIN;  // a non-word is replaced if the winner is this far ahead of keeping it
 const double kSeenWordMargin = KB_SEEN_MARGIN; // extra lead needed if the typed word occurs in real text
                                               // (a variant spelling - проєкт/проект - more often than a typo)
-const double kExtraEditMargin = 2.0;  // ... plus this much for every edit beyond the first
+#ifndef KB_EXTRA
+#define KB_EXTRA 1.0
+#endif
+const double kExtraEditMargin = KB_EXTRA;  // ... plus this much for every edit beyond the first
 const double kAmbiguity     = 1.6;    // ... and only if the runner-up is this far behind
 const double kCommonWord    = std::log(std::pow(10.0, 3.0 - 9));   // Zipf 3: common enough to suggest
                                                                     // without being in the dictionary (slang)
+#ifndef KB_AMB_FAR
+#define KB_AMB_FAR 0.5
+#endif
+#ifndef KB_RARE
+#define KB_RARE 2.0
+#endif
+const double kRareWord     = std::log(std::pow(10.0, KB_RARE - 9));  // rarer than this: seen in text, but likely a typo there too
 const double kLearnedWord   = std::log(std::pow(10.0, 3.5 - 9));   // user's own words
 const double kKeepBonus     = 1.0;    // typing what you meant is likelier than any particular slip
 const double kNotInDictionary = 3.0;  // a word the dictionary doesn't know is often a frequent misspelling
@@ -47,6 +66,7 @@ const Confusion kUkrainianPairs[] = {
     {U'і', U'и', 2.0}, {U'и', U'і', 2.0}, {U'е', U'и', 2.4}, {U'и', U'е', 2.4}, {U'е', U'є', 2.0}, {U'є', U'е', 2.0},
     {U'і', U'ї', 2.0}, {U'ї', U'і', 2.0}, {U'г', U'ґ', 1.8}, {U'ґ', U'г', 1.8}, {U'ш', U'щ', 2.2}, {U'щ', U'ш', 2.2},
     {U'о', U'а', 3.0}, {U'а', U'о', 3.0}, {U'й', U'і', 2.6}, {U'і', U'й', 2.6},
+    {U'а', U'я', 2.6}, {U'я', U'а', 2.6}, {U'у', U'ю', 2.6}, {U'ю', U'у', 2.6},
 };
 const Confusion kEnglishPairs[] = {
     {U'a', U'e', 3.0}, {U'e', U'a', 3.0}, {U'e', U'i', 3.0}, {U'i', U'e', 3.0}, {U'i', U'y', 3.0}, {U'y', U'i', 3.0},
@@ -362,7 +382,9 @@ u32 orthographyKey(u32 w) {
     return w;
 }
 
-int maxEditsFor(size_t len) { return len <= 5 ? 1 : len <= 9 ? 2 : 3; }
+int maxEditsFor(size_t len) { return len <= 5 ? 1 : len <= KB_E2 ? 2 : len <= KB_E3 ? 3 : 4; }
+#ifndef KB_E2
+#endif
 
 }  // namespace
 
@@ -437,7 +459,7 @@ int kb_correct(KBModel* m, const char* typedUtf8, const char* prevUtf8, const ch
         if (distance(typed, l) <= maxEditsFor(typed.size())) cands.push_back({-1, l});
 
     double best = -1e18, second = -1e18;
-    u32 winner;
+    u32 winner, runnerUp;
     int looked = 0;
     for (const Candidate& c : cands) {
         if (c.text == typed || c.text.size() < 3) continue;          // never "fix" into a tiny word
@@ -448,16 +470,19 @@ int kb_correct(KBModel* m, const char* typedUtf8, const char* prevUtf8, const ch
         }
         if (++looked > m->budget) return 0;
         double s = score(c.id, c.text) - typingCost(m, typed, c.text);
-        if (s > best) { second = best; best = s; winner = c.text; }
-        else if (s > second) second = s;
+        if (s > best) { second = best; runnerUp = winner; best = s; winner = c.text; }
+        else if (s > second) { second = s; runnerUp = c.text; }
     }
     if (winner.empty()) return 0;
     if (m->ukrainian && orthographyKey(winner) == orthographyKey(typed)) return 0;
     double lead = best - keep;
     if (margin) *margin = lead;
-    double needed = kNonWordMargin + kExtraEditMargin * (distance(typed, winner) - 1) + (typedId >= 0 ? kSeenWordMargin : 0);
+    double needed = kNonWordMargin + kExtraEditMargin * (distance(typed, winner) - 1) + (typedId < 0 ? 0 : m->uni[typedId] >= kRareWord ? kSeenWordMargin : kSeenWordMargin / 2);
     if (lead < needed) return 0;
-    if (best - second < kAmbiguity) return 0;
+    // Too close to call - unless the runner-up needs more edits than the winner (mistakess: mistakes
+    // vs mistake), where the nearer word is the safer reading.
+    if (best - second < kAmbiguity && (runnerUp.empty() || distance(typed, runnerUp) <= distance(typed, winner) ||
+                                       best - second < KB_AMB_FAR)) return 0;
 
     std::string s = encode(winner);
     if ((int)s.size() + 1 > outSize) return 0;
