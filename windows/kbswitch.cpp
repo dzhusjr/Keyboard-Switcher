@@ -1180,6 +1180,8 @@ private:
             if (inEnglish && config.transliteration && transliterate(f)) return;
             if (config.typoFixing == L"careful" && fixTypo(inEnglish)) return;
             if (config.typoFixing == L"smart" && smartFix(inEnglish)) return;
+            // This word shows which language you're writing in: fix a short word before it (jr? -> ок?).
+            convertShortPrevious(f, inEnglish);
             logLine(L"skip: '" + (inEnglish ? job_.enText : job_.ukText) + L"' is on screen and is fine: " + *why);
             skipWord();
             return;
@@ -1430,6 +1432,46 @@ private:
             last_ = cc;
             return;
         }
+    }
+
+    /// A word too short to convert on its own is converted once the next word, typed correctly in
+    /// the other layout, shows the language. It must be a word there and not one in its own layout,
+    /// left alone by KBSwitch, and the field must show exactly "short word + this word". The edit is
+    /// queued and goes out with this word's Space.
+    void convertShortPrevious(const FieldRead& f, bool inEnglish) {
+        if (history_.empty() || history_.back().changed || history_.back().keys.empty() || history_.back().keys.size() > 4) return;
+        const Entry prev = history_.back();
+        HKL here = inEnglish ? g_layouts.en : g_layouts.uk, there = inEnglish ? g_layouts.uk : g_layouts.en;
+        wstring hereLang = inEnglish ? L"en" : L"uk", thereLang = inEnglish ? L"uk" : L"en";
+        wstring from, to;
+        for (const Key& k : prev.keys) {
+            wstring a = Layouts::charFor(k, there);
+            if (a.empty()) return;
+            from += a;
+            wstring b = Lexicon::letterOf(a[0], thereLang) ? Layouts::charFor(k, here) : a;   // punctuation stays
+            to += b.empty() ? a : b;
+        }
+        wstring cur = inEnglish ? job_.enText : job_.ukText;
+        if (auto why = Decision::rejection(from, to, thereLang, hereLang, std::min(2, config.minLength), exceptions())) {
+            logLine(L"short previous '" + from + L"': " + *why);
+            return;
+        }
+        if (!fieldShows(f, from + L" " + cur)) { logLine(L"short previous: the field doesn't show '" + from + L" " + cur + L"'"); return; }
+        logLine(L"short previous: '" + from + L" " + cur + L"' -> '" + to + L" " + cur + L"'");
+        for (size_t i = 0; i < cur.size() + 1 + from.size(); i++) addKey(pending_, VK_BACK);
+        addText(pending_, to + L" " + cur);
+        history_.pop_back();
+        history_.push_back({{}, true});
+        Correction c;
+        c.typedKeys = prev.keys;
+        c.typedKeys.push_back(Key{VK_SPACE, 0, false, false});
+        c.typedKeys.insert(c.typedKeys.end(), job_.keys.begin(), job_.keys.end());
+        c.typedText = from + L" " + cur;
+        c.inserted = to + L" " + cur;
+        c.fromLayout = here;
+        c.words = {from};
+        c.time = GetTickCount64();
+        last_ = c;
     }
 
     void finishUndo(const FieldRead& f) {

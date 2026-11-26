@@ -987,6 +987,8 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 if typedInEnglish, settings.transliteration, transliterate(enChars, appID, streak: streak, proxy) { return true }
                 // A rare word one slip from a very common one (kike → like).
                 if settings.typoFixing == "smart", smartFix(enChars, ukChars, appID, proxy) { return true }
+                // This word shows which language you're writing in: fix a short word before it.
+                if convertShortPrevious(inEnglish: typedInEnglish, current: typedInEnglish ? enChars : ukChars, proxy) { return true }
                 return skip("'\(typedInEnglish ? enText : ukText)' is on screen and is fine: \(why)")
             }
         case .unverified, .unknown, .notText:
@@ -1332,6 +1334,51 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let space = Key(code: UInt16(kVK_Space), shift: false, caps: false, char: " ")
         last = Correction(typed: prevKeys + [space] + currentKeys, inserted: fixed + " " + current,
                           from: layout.source, words: [prevText], time: Date())
+        return true
+    }
+
+    /// A word too short to convert on its own (jr? → ок?) is converted once the next word shows the
+    /// language: you then typed a correct word in the other layout. The short word must be a word in
+    /// that language and not one in its own, KBSwitch must have left it alone, and the field must
+    /// show exactly "short word + this word".
+    private func convertShortPrevious(inEnglish: Bool, current: [String], _ proxy: CGEventTapProxy) -> Bool {
+        guard let en = layouts.english, let uk = layouts.ukrainian,
+              let prev = history.last, !prev.changed, !prev.keys.isEmpty, prev.keys.count <= 4 else { return false }
+        let here = inEnglish ? en : uk, there = inEnglish ? uk : en
+        let fromChars = prev.keys.compactMap { there.char(for: $0) }
+        guard fromChars.count == prev.keys.count else { return false }
+        // Letters change layout; punctuation around them stays as typed (jr? → ок?, not ок,).
+        let toChars = zip(prev.keys, fromChars).map { key, ch in
+            ch.first.map { Decision.isLetter($0, there.lang) } == true ? (here.char(for: key) ?? ch) : ch
+        }
+        let from = fromChars.joined(), to = toChars.joined(), cur = current.joined()
+        let exceptions = settings.exceptions.union(sessionIgnore)
+        if let why = Decision.rejection(typed: from, converted: to, fromLang: there.lang, toLang: here.lang,
+                                        minLength: min(2, settings.minLength), exceptions: exceptions, isWord: lexicon.isWord) {
+            DebugLog.write("short previous '\(from)': \(why)")
+            return false
+        }
+        guard FocusedField.check(candidates: [from + " " + cur]) == .verified else {
+            DebugLog.write("short previous '\(from)': field doesn't show '\(from) \(cur)'")
+            return false
+        }
+        DebugLog.write("short previous: '\(from) \(cur)' → '\(to) \(cur)'")
+
+        for _ in 0 ..< current.count + 1 + fromChars.count { post(UInt16(kVK_Delete), nil, shift: false, proxy) }
+        let newPrev = zip(prev.keys, toChars).map { Key(code: $0.code, shift: $0.shift, caps: $0.caps, char: $1) }
+        let curKeys = zip(buffer, current).map { Key(code: $0.code, shift: $0.shift, caps: $0.caps, char: $1) }
+        let space = Key(code: UInt16(kVK_Space), shift: false, caps: false, char: " ")
+        for k in newPrev + [space] + curKeys + [space] { post(k.code, k.char, shift: k.shift, proxy) }
+
+        let oldPrev = zip(prev.keys, fromChars).map { Key(code: $0.code, shift: $0.shift, caps: $0.caps, char: $1) }
+        last = Correction(typed: oldPrev + [space] + curKeys, inserted: to + " " + cur,
+                          from: here.source, words: [from], time: Date())
+        history.removeLast()
+        history.append((newPrev, prev.atStart, true))
+        buffer = curKeys
+        pushWord(curKeys)
+        buffer.removeAll()
+        atWordStart = true
         return true
     }
 
