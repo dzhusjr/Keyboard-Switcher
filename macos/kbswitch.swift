@@ -383,15 +383,36 @@ final class SmartCorrector {
     private var en: OpaquePointer?
     private var uk: OpaquePointer?
     private var loading = false
+    private var generation = 0                       // bumped by unload(): a load in flight is discarded
     var ready: Bool { en != nil && uk != nil }
+
+    /// Frees the language data (about 20 MB) and gives the memory back to macOS.
+    func unload() {
+        generation += 1
+        loading = false
+        guard en != nil || uk != nil else { return }
+        if let e = en { kb_free(e) }
+        if let u = uk { kb_free(u) }
+        en = nil
+        uk = nil
+        malloc_zone_pressure_relief(nil, 0)
+        DebugLog.write("smart typo fixing: language data unloaded")
+    }
 
     func load(keys: [(lang: String, code: UInt32, row: Int32, col: Int32)], learned: [String]) {
         guard !ready, !loading else { learn(learned); return }
         loading = true
+        let gen = generation
         DispatchQueue.global(qos: .utility).async {
             let e = Bundle.main.path(forResource: "en", ofType: "kbm").flatMap { kb_load($0) }
             let u = Bundle.main.path(forResource: "uk", ofType: "kbm").flatMap { kb_load($0) }
             DispatchQueue.main.async {
+                guard gen == self.generation else {          // turned off while loading
+                    if let e = e { kb_free(e) }
+                    if let u = u { kb_free(u) }
+                    malloc_zone_pressure_relief(nil, 0)
+                    return
+                }
                 self.en = e
                 self.uk = u
                 self.loading = false
@@ -446,6 +467,12 @@ final class Lexicon {
             _ = checker.checkSpelling(of: "test", startingAt: 0, language: code, wrap: false,
                                       inSpellDocumentWithTag: 0, wordCount: nil)
         }
+        reloadWordLists()
+    }
+
+    /// Loads the Ukrainian dictionary (about 30 MB in memory). Only while KBSwitch is enabled.
+    func load() {
+        guard hunspell == nil else { return }
         let candidates = [Bundle.main.resourceURL, FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Spelling")].compactMap { $0 }
         for dir in candidates {
@@ -454,7 +481,14 @@ final class Lexicon {
             else { continue }
             if let h = Hunspell_create(aff.path, dic.path) { hunspell = h; hunspellSource = dic.path; break }
         }
-        reloadWordLists()
+    }
+
+    /// Frees the dictionary and gives the memory back to macOS.
+    func unload() {
+        guard let h = hunspell else { return }
+        Hunspell_destroy(h)
+        hunspell = nil
+        malloc_zone_pressure_relief(nil, 0)
     }
 
     func reloadWordLists() {
@@ -713,9 +747,6 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var active: Bool { settings.enabled }
 
     func start() {
-        // App Nap would delay the event tap after a while in the background.
-        activity = ProcessInfo.processInfo.beginActivity(
-            options: [.userInitiatedAllowingIdleSystemSleep, .latencyCritical], reason: "Watching typing")
         reloadIfChanged(force: true)
         observeSystem()
         // First launch: start at login by default (toggle in the menu).
@@ -741,6 +772,7 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func report() {
         headless = true
         reloadIfChanged(force: true)
+        lexicon.load()
         print("English layout:   \(layouts.english?.id ?? "NOT FOUND")")
         print("Ukrainian layout: \(layouts.ukrainian?.id ?? "NOT FOUND")")
         print("English words:    \(lexicon.describe("en"))")
@@ -764,7 +796,7 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                         userInfo: Unmanaged.passUnretained(self).toOpaque()) else { return false }
         tap = t
         CFRunLoopAddSource(CFRunLoopGetMain(), CFMachPortCreateRunLoopSource(kCFAllocatorDefault, t, 0), .commonModes)
-        CGEvent.tapEnable(tap: t, enable: true)
+        CGEvent.tapEnable(tap: t, enable: settings.enabled)
         DebugLog.write("event tap installed (pid \(ProcessInfo.processInfo.processIdentifier), Accessibility \(AXIsProcessTrusted()))")
         return true
     }
@@ -812,9 +844,30 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         stamps = [Files.modified(Files.settings), Files.modified(Files.exceptions)]
         layouts.reload(settings)
         lexicon.reloadWordLists()
-        if settings.typoFixing == "smart" { startSmart() }
+        applyEnabled()
         if DebugLog.on && !wasLogging { DebugLog.start(diagnostics()) }
         updateMenu()
+    }
+
+    /// Only what's switched on is loaded. Disabled: the event tap is off (no key ever reaches
+    /// KBSwitch), both dictionaries are freed and App Nap may suspend the app. Smart typo fixing
+    /// off: its language data is freed. Transliteration and Careful mode use small built-in tables.
+    private func applyEnabled() {
+        let on = settings.enabled
+        if let t = tap, CGEvent.tapIsEnabled(tap: t) != on { CGEvent.tapEnable(tap: t, enable: on) }
+        if on {
+            lexicon.load()
+            // App Nap would delay the event tap after a while in the background.
+            if activity == nil {
+                activity = ProcessInfo.processInfo.beginActivity(
+                    options: [.userInitiatedAllowingIdleSystemSleep, .latencyCritical], reason: "Watching typing")
+            }
+        } else {
+            buffer.removeAll(); history.removeAll(); atWordStart = false; last = nil
+            lexicon.unload()
+            if let a = activity { ProcessInfo.processInfo.endActivity(a); activity = nil }
+        }
+        if on && settings.typoFixing == "smart" { startSmart() } else { smart.unload() }
     }
 
     /// Loads the language data (once) and tells it the keyboard and the user's own words.
@@ -880,7 +933,7 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
         switch type {
         case .keyDown: break
         case .tapDisabledByTimeout, .tapDisabledByUserInput:
-            if let t = tap { CGEvent.tapEnable(tap: t, enable: true) }
+            if let t = tap { CGEvent.tapEnable(tap: t, enable: settings.enabled) }
             DebugLog.write("event tap was disabled by macOS (\(type.rawValue)); re-enabled")
             reset("event tap re-enabled"); return pass
         default:                                   // mouse click: the caret may have moved

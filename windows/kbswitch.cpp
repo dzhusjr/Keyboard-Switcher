@@ -32,6 +32,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <mutex>
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
@@ -333,6 +334,7 @@ struct Speller {
         h = Hunspell_create(a.c_str(), d.c_str());
 #endif
     }
+    void unload() { if (h) { Hunspell_destroy(h); h = nullptr; } }
     bool ok() const { return h != nullptr; }
     bool spell(const wstring& w) const { return h && Hunspell_spell(h, utf8(w).c_str()) != 0; }
 };
@@ -340,10 +342,22 @@ struct Speller {
 struct Lexicon {
     Speller en, uk;
 
+    bool loaded = false;
+
+    /// About 40 MB for both dictionaries: loaded only while KBSwitch is enabled.
     void load() {
+        if (loaded) return;
+        loaded = true;
         wstring dir = exeDir() + L"\\dict\\";
         en.load(dir + L"en_US");
         uk.load(dir + L"uk_UA");
+    }
+
+    void unload() {
+        if (!loaded) return;
+        loaded = false;
+        en.unload();
+        uk.unload();
     }
 
     bool supports(const wstring& lang) const { return lang == L"uk" ? uk.ok() : en.ok(); }
@@ -544,14 +558,28 @@ struct Smart {
     KBModel* uk = nullptr;
     std::atomic<bool> loaded{false};
     bool started = false;
+    std::mutex lock;               // guards publishing the loaded models against stop()
+    int generation = 0;            // bumped by stop(): a load in flight is discarded
 
     bool ready() const { return loaded.load(); }
 
     void start(const std::set<wstring>& learned) {
         if (started) { learn(learned); return; }
         started = true;
-        auto* words = new vector<wstring>(learned.begin(), learned.end());
-        CreateThread(nullptr, 0, &Smart::loadThread, words, 0, nullptr);
+        auto* job = new std::pair<int, vector<wstring>>(generation, vector<wstring>(learned.begin(), learned.end()));
+        HANDLE t = CreateThread(nullptr, 0, &Smart::loadThread, job, 0, nullptr);
+        if (t) CloseHandle(t);
+    }
+
+    /// Frees the language data (about 20 MB) when Smart is switched off or KBSwitch is disabled.
+    void stop() {
+        std::lock_guard<std::mutex> g(lock);
+        generation++;
+        started = false;
+        loaded = false;
+        if (en) kb_free(en);
+        if (uk) kb_free(uk);
+        en = uk = nullptr;
     }
 
     void learn(const std::set<wstring>& words) {
@@ -584,7 +612,8 @@ struct Smart {
 static Smart g_smart;
 
 DWORD WINAPI Smart::loadThread(LPVOID param) {
-    std::unique_ptr<vector<wstring>> learned(static_cast<vector<wstring>*>(param));
+    std::unique_ptr<std::pair<int, vector<wstring>>> job(static_cast<std::pair<int, vector<wstring>>*>(param));
+    const vector<wstring>* learned = &job->second;
     wstring dir = exeDir() + L"\\dict\\";
     KBModel* e = kb_load_w((dir + L"en.kbm").c_str());
     KBModel* u = kb_load_w((dir + L"uk.kbm").c_str());
@@ -595,6 +624,12 @@ DWORD WINAPI Smart::loadThread(LPVOID param) {
             if (*p != L'\'' && Typos::position(*p, hkl, row, col)) kb_set_key(m, (unsigned)*p, row, col);
         }
         for (const wstring& w : *learned) kb_learn(m, utf8(w).c_str());
+    }
+    std::lock_guard<std::mutex> g(g_smart.lock);
+    if (job->first != g_smart.generation) {          // switched off while loading
+        if (e) kb_free(e);
+        if (u) kb_free(u);
+        return 0;
     }
     g_smart.en = e;
     g_smart.uk = u;
@@ -789,6 +824,10 @@ struct Job {
     WORD heldKey = VK_SPACE;   // the key we swallowed to start the job
 };
 
+/// Disabled: the keyboard hook is removed (no key ever reaches KBSwitch) and the dictionaries are
+/// freed. Enabled: dictionaries loaded, hook installed. Defined after the hook procedure.
+static void applyEnabled(bool on);
+
 class Engine {
 public:
     Config config;
@@ -796,7 +835,11 @@ public:
 
     void reloadConfig() {
         config = Config::load();
-        if (config.typoFixing == L"smart") g_smart.start(config.exceptions);
+        applyEnabled(config.enabled);
+        if (!config.enabled) { buffer_.clear(); history_.clear(); atWordStart_ = false; last_.reset(); }
+        // Only what's switched on is loaded: Smart's language data is freed when it's off.
+        if (config.enabled && config.typoFixing == L"smart") g_smart.start(config.exceptions);
+        else g_smart.stop();
         bool wasLogging = g_logOn;
         g_logOn = config.debugLog;
         if (g_logOn && !wasLogging) writeLogHeader();
@@ -1579,6 +1622,17 @@ static Engine g_engine;
 // ============================================================================================
 
 static HHOOK g_keyboardHook = nullptr;
+static LRESULT CALLBACK keyboardProc(int code, WPARAM wp, LPARAM lp);
+
+static void applyEnabled(bool on) {
+    if (on) {
+        g_lexicon.load();
+        if (!g_keyboardHook) g_keyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, keyboardProc, GetModuleHandleW(nullptr), 0);
+    } else {
+        if (g_keyboardHook) { UnhookWindowsHookEx(g_keyboardHook); g_keyboardHook = nullptr; }
+        g_lexicon.unload();
+    }
+}
 static HWND g_lastFocus = nullptr;
 
 static LRESULT CALLBACK keyboardProc(int code, WPARAM wp, LPARAM lp) {
@@ -1956,7 +2010,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     Config::load(&firstRun);
     if (firstRun) setStartWithWindows(true);         // start with Windows by default (toggle in Settings)
     g_layouts.reload();
-    g_lexicon.load();
     g_engine.reloadConfig();
     g_reader.start(g_engine.hwnd);
     updateTray(true);
@@ -1968,7 +2021,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         Shell_NotifyIconW(NIM_MODIFY, &g_tray);
     }
 
-    g_keyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, keyboardProc, inst, 0);
+    applyEnabled(g_engine.config.enabled);
     HWINEVENTHOOK fg = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr, focusProc, 0, 0, WINEVENT_OUTOFCONTEXT);
     HWINEVENTHOOK focus = SetWinEventHook(EVENT_OBJECT_FOCUS, EVENT_OBJECT_FOCUS, nullptr, focusProc, 0, 0, WINEVENT_OUTOFCONTEXT);
     logLine(L"started");
@@ -1980,7 +2033,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         DispatchMessageW(&msg);
     }
 
-    UnhookWindowsHookEx(g_keyboardHook);
+    applyEnabled(false);
     UnhookWinEvent(fg);
     UnhookWinEvent(focus);
     Shell_NotifyIconW(NIM_DELETE, &g_tray);
