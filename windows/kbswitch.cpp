@@ -1217,6 +1217,29 @@ private:
         gti.cbSize = sizeof gti;
         if (GetGUIThreadInfo(GetWindowThreadProcessId(target, nullptr), &gti) && gti.hwndFocus) target = gti.hwndFocus;
         PostMessageW(target, WM_INPUTLANGCHANGEREQUEST, 0, (LPARAM)hkl);
+        // A switch asked for right after another one (fix, then undo) can be dropped: check that it
+        // took, and ask again up to three times.
+        s_wantedLayout = hkl;
+        s_layoutTries = 3;
+        SetTimer(nullptr, 0, 150, &Engine::verifyLayout);
+    }
+
+    static inline HKL s_wantedLayout = nullptr;
+    static inline int s_layoutTries = 0;
+
+    static void CALLBACK verifyLayout(HWND, UINT, UINT_PTR id, DWORD) {
+        KillTimer(nullptr, id);
+        HWND fg = GetForegroundWindow();
+        if (!fg || !s_wantedLayout) return;
+        HKL now = GetKeyboardLayout(GetWindowThreadProcessId(fg, nullptr));
+        if (LOWORD((UINT_PTR)now) == LOWORD((UINT_PTR)s_wantedLayout) || --s_layoutTries < 0) return;
+        logLine(L"layout didn't change: switching again");
+        HWND target = fg;
+        GUITHREADINFO gti{};
+        gti.cbSize = sizeof gti;
+        if (GetGUIThreadInfo(GetWindowThreadProcessId(fg, nullptr), &gti) && gti.hwndFocus) target = gti.hwndFocus;
+        PostMessageW(target, WM_INPUTLANGCHANGEREQUEST, 0, (LPARAM)s_wantedLayout);
+        SetTimer(nullptr, 0, 150, &Engine::verifyLayout);
     }
 
     void skipWord() {

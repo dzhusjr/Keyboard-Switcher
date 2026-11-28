@@ -912,7 +912,25 @@ final class Engine: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func selectLayout(_ source: TISInputSource) {
         ownSwitchUntil = Date().addingTimeInterval(1.5)
         TISSelectInputSource(source)
+        // macOS can drop a switch asked for right after another one (fix, then undo within a second):
+        // check that it took, and ask again up to three times.
+        let wanted = tisValue(source, kTISPropertyInputSourceID) as? String
+        layoutRequest += 1
+        let request = layoutRequest
+        func verify(_ tries: Int) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+                guard let self = self, request == self.layoutRequest, let wanted = wanted else { return }
+                let now = Layouts.currentID()
+                guard now != wanted else { return }
+                DebugLog.write("layout is \(now), not \(wanted): switching again")
+                self.ownSwitchUntil = Date().addingTimeInterval(1.5)
+                TISSelectInputSource(source)
+                if tries > 1 { verify(tries - 1) }
+            }
+        }
+        verify(3)
     }
+    private var layoutRequest = 0
 
     /// "en|uk" spelling of keys, for the log.
     private func spell(_ keys: [Key]) -> String {
